@@ -1,0 +1,13 @@
+{
+  "domain": "tydom",
+  "name": "Tydom Delta Dore",
+  "version": "1.0.0",
+  "documentation": "https://github.com/VOTRE_USERNAME/ha-tydom",
+  "issue_tracker": "https://github.com/VOTRE_USERNAME/ha-tydom/issues",
+  "requirements": ["websockets>=11.0"],
+  "dependencies": [],
+  "codeowners": ["@VOTRE_USERNAME"],
+  "iot_class": "local_push",
+  "config_flow": true,
+  "integration_type": "hub"
+}

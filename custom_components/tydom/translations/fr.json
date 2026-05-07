@@ -1,0 +1,28 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Configurer la box Tydom",
+        "description": "Entrez les informations de connexion à votre box Tydom Delta Dore.",
+        "data": {
+          "mac_address": "Adresse MAC de la box Tydom",
+          "password": "Code PIN / Mot de passe Tydom",
+          "host": "Adresse IP (optionnel, laissez vide pour autodécouverte)"
+        },
+        "data_description": {
+          "mac_address": "Format : AA:BB:CC:DD:EE:FF (trouvable sous la box)",
+          "password": "Code PIN imprimé sur l'étiquette de votre box",
+          "host": "Utile si la découverte mDNS ne fonctionne pas sur votre réseau"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Impossible de se connecter à la box Tydom. Vérifiez l'adresse MAC, le mot de passe et que la box est accessible sur votre réseau.",
+      "invalid_mac": "Format d'adresse MAC invalide. Utilisez le format AA:BB:CC:DD:EE:FF.",
+      "unknown": "Erreur inattendue."
+    },
+    "abort": {
+      "already_configured": "Cette box Tydom est déjà configurée."
+    }
+  }
+}

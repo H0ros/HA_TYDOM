@@ -1,0 +1,28 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Configure Tydom Box",
+        "description": "Enter the connection details for your Delta Dore Tydom box.",
+        "data": {
+          "mac_address": "Tydom MAC Address",
+          "password": "PIN Code / Password",
+          "host": "IP Address (optional, leave empty for auto-discovery)"
+        },
+        "data_description": {
+          "mac_address": "Format: AA:BB:CC:DD:EE:FF (found on the underside of your box)",
+          "password": "PIN code printed on your box label",
+          "host": "Useful if mDNS discovery does not work on your network"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Unable to connect to the Tydom box. Check MAC address, password and ensure the box is reachable on your network.",
+      "invalid_mac": "Invalid MAC address format. Use AA:BB:CC:DD:EE:FF.",
+      "unknown": "Unexpected error."
+    },
+    "abort": {
+      "already_configured": "This Tydom box is already configured."
+    }
+  }
+}
