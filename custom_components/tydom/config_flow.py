@@ -30,11 +30,19 @@ async def _test_connection(hass: HomeAssistant, mac: str, password: str, host: s
     try:
         success = await client.connect()
         if not success:
+            _LOGGER.error(
+                "Connexion Tydom refusée (MAC=%s, host=%s). "
+                "Activez les logs debug sur custom_components.tydom pour plus de détails.",
+                mac, client.host,
+            )
             return "cannot_connect"
         await client.disconnect()
         return None
     except Exception as err:
-        _LOGGER.error("Erreur test connexion Tydom: %s", err)
+        _LOGGER.error(
+            "Exception lors du test de connexion Tydom (MAC=%s, host=%s): %s",
+            mac, host, err, exc_info=True,
+        )
         return "cannot_connect"
 
 

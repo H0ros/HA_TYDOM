@@ -1,14 +1,20 @@
-"""Client WebSocket pour la box Tydom Delta Dore."""
+"""Client WebSocket pour la box Tydom Delta Dore.
+
+Protocole réel Tydom :
+  1. Connexion WSS sans credentials (la box accepte l'upgrade)
+  2. La box envoie immédiatement un challenge HTTP 401 Digest dans le tunnel WS
+  3. On répond avec Authorization: Digest calculé (realm=MDCOM)
+  4. La box confirme avec HTTP 200 OK
+  5. Toutes les commandes suivantes sont des requêtes HTTP/1.1 dans le tunnel WS
+"""
 from __future__ import annotations
 
 import asyncio
-import base64
 import hashlib
 import json
 import logging
+import re
 import ssl
-import time
-from http.client import HTTPSConnection
 from typing import Any, Callable
 
 import websockets
@@ -16,19 +22,27 @@ from websockets.exceptions import ConnectionClosed
 
 _LOGGER = logging.getLogger(__name__)
 
-TYDOM_HOST = "{mac_address}-tydom.local"
-TYDOM_URL = "wss://{host}/mediation/client?mac={mac}&appli=1"
+# mDNS local : <MAC_minuscules>-tydom.local
+TYDOM_MDNS = "{mac_lower}-tydom.local"
+# URL WebSocket — pas de credentials dans l'URL
+TYDOM_WS_URL = "wss://{host}/mediation/client?mac={mac}&appli=1"
 
-# Commandes Tydom
+# Realm fixe de la box Tydom
+TYDOM_REALM = "MDCOM"
+
+# Commandes internes Tydom (envoyées comme requêtes HTTP dans le tunnel WS)
 CMD_GET_DEVICES = "/devices/data"
 CMD_GET_CONFIGS = "/devices/cconfig"
-CMD_GET_META = "/devices/meta"
-CMD_GET_INFOS = "/infos"
+CMD_GET_META    = "/devices/meta"
+CMD_GET_INFOS   = "/infos"
 CMD_POST_REFRESH = "/refresh/all"
+
+# Délai de reconnexion
+RECONNECT_DELAY = 30
 
 
 class TydomClient:
-    """Client pour communiquer avec la box Tydom via WebSocket."""
+    """Client Tydom : connexion WSS + authentification HTTP Digest dans le tunnel."""
 
     def __init__(
         self,
@@ -37,142 +51,248 @@ class TydomClient:
         host: str | None = None,
         callback: Callable | None = None,
     ) -> None:
-        """Initialise le client Tydom."""
-        self.mac = mac_address.upper().replace(":", "")
+        # Normalisation MAC : "AA:BB:CC:DD:EE:FF" → "AABBCCDDEEFF"
+        self.mac = mac_address.upper().replace(":", "").replace("-", "")
         self.password = password
-        self.host = host or TYDOM_HOST.format(mac_address=self.mac.lower())
+        # Si pas d'IP fournie → découverte mDNS
+        self.host = host if host else TYDOM_MDNS.format(mac_lower=self.mac.lower())
         self.callback = callback
+
         self._websocket = None
         self._running = False
         self._msg_id = 0
-        self._ssl_context = self._create_ssl_context()
+        self._ssl_context = self._make_ssl_context()
 
-    def _create_ssl_context(self) -> ssl.SSLContext:
-        """Crée un contexte SSL sans vérification de certificat."""
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
-        return context
+    # ──────────────────────────────────────────────────────────────────────
+    # SSL
+    # ──────────────────────────────────────────────────────────────────────
 
-    def _get_credentials(self) -> str:
-        """Génère les credentials d'authentification Tydom."""
-        # La box Tydom utilise le protocole HTTP Digest avec WebSocket
-        # Username = adresse MAC, password = code Tydom
-        credentials = f"{self.mac}:{self.password}"
-        encoded = base64.b64encode(credentials.encode()).decode()
-        return encoded
+    @staticmethod
+    def _make_ssl_context() -> ssl.SSLContext:
+        """SSL sans vérification : la box utilise un certificat auto-signé."""
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
 
-    def _next_msg_id(self) -> str:
-        """Retourne le prochain ID de message."""
+    # ──────────────────────────────────────────────────────────────────────
+    # Helpers HTTP-dans-WS
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _next_id(self) -> str:
         self._msg_id += 1
         return str(self._msg_id)
 
-    def _build_http_request(self, method: str, uri: str, body: str = "") -> str:
-        """Construit une requête HTTP/1.1 formatée pour Tydom."""
-        msg_id = self._next_msg_id()
-        headers = [
+    def _make_request(self, method: str, uri: str,
+                      extra_headers: dict | None = None,
+                      body: str = "") -> str:
+        """Formate une requête HTTP/1.1 à envoyer dans le tunnel WebSocket."""
+        lines = [
             f"{method} {uri} HTTP/1.1",
             f"Host: {self.host}",
-            f"Content-Length: {len(body)}",
+            f"Transac-Id: {self._next_id()}",
             f"Content-Type: application/json; charset=UTF-8",
-            f"Transac-Id: {msg_id}",
+            f"Content-Length: {len(body.encode())}",
         ]
-        if body:
-            return "\r\n".join(headers) + "\r\n\r\n" + body
-        return "\r\n".join(headers) + "\r\n\r\n"
+        if extra_headers:
+            for k, v in extra_headers.items():
+                lines.append(f"{k}: {v}")
+        lines.append("")   # ligne vide séparatrice
+        lines.append(body)
+        return "\r\n".join(lines)
 
-    async def _authenticate(self, websocket) -> bool:
-        """Authentifie le client auprès de la box Tydom."""
-        # Étape 1 : Récupérer le challenge (nonce)
-        await websocket.send(self._build_http_request("GET", "/mediation/client?mac={}&appli=1".format(self.mac)))
-        
-        try:
-            response = await asyncio.wait_for(websocket.recv(), timeout=10)
-            _LOGGER.debug("Challenge reçu: %s", response[:200])
-        except asyncio.TimeoutError:
-            _LOGGER.error("Timeout en attendant le challenge d'authentification")
-            return False
+    @staticmethod
+    def _parse_nonce(raw: str) -> str | None:
+        """Extrait le nonce depuis un header WWW-Authenticate: Digest …"""
+        # Cherche: nonce="<valeur>"
+        m = re.search(r'[Nn]once="([^"]+)"', raw)
+        return m.group(1) if m else None
 
-        # Chercher le nonce dans la réponse 401
-        nonce = None
-        for line in response.split("\r\n"):
-            if "Nonce=" in line or "nonce=" in line.lower():
-                try:
-                    nonce = line.split('"')[1]
-                    break
-                except (IndexError, ValueError):
-                    pass
-
-        if not nonce:
-            # Peut-être déjà authentifié ou pas de challenge requis
-            _LOGGER.debug("Pas de nonce trouvé, authentification directe")
-            return True
-
-        # Étape 2 : Calculer la réponse Digest
-        ha1 = hashlib.md5(f"{self.mac}:MDCOM:{self.password}".encode()).hexdigest()
-        ha2 = hashlib.md5(f"GET:/mediation/client?mac={self.mac}&appli=1".encode()).hexdigest()
-        digest = hashlib.md5(f"{ha1}:{nonce}:{ha2}".encode()).hexdigest()
-
-        auth_header = (
-            f'Authorization: Digest username="{self.mac}", '
-            f'realm="MDCOM", nonce="{nonce}", '
-            f'uri="/mediation/client?mac={self.mac}&appli=1", '
-            f'response="{digest}"'
+    def _digest_response(self, nonce: str) -> str:
+        """
+        Calcule la réponse HTTP Digest (RFC 2617, sans qop).
+        HA1 = MD5(username:realm:password)
+        HA2 = MD5(method:uri)
+        response = MD5(HA1:nonce:HA2)
+        """
+        uri = f"/mediation/client?mac={self.mac}&appli=1"
+        ha1 = hashlib.md5(f"{self.mac}:{TYDOM_REALM}:{self.password}".encode()).hexdigest()
+        ha2 = hashlib.md5(f"GET:{uri}".encode()).hexdigest()
+        response = hashlib.md5(f"{ha1}:{nonce}:{ha2}".encode()).hexdigest()
+        return (
+            f'Digest username="{self.mac}", '
+            f'realm="{TYDOM_REALM}", '
+            f'nonce="{nonce}", '
+            f'uri="{uri}", '
+            f'response="{response}"'
         )
 
-        auth_request = (
-            f"GET /mediation/client?mac={self.mac}&appli=1 HTTP/1.1\r\n"
-            f"Host: {self.host}\r\n"
-            f"{auth_header}\r\n\r\n"
-        )
-
-        await websocket.send(auth_request)
-
-        try:
-            auth_response = await asyncio.wait_for(websocket.recv(), timeout=10)
-            _LOGGER.debug("Réponse auth: %s", auth_response[:200])
-            if "200 OK" in auth_response or "101" in auth_response:
-                _LOGGER.info("Authentification réussie")
-                return True
-            else:
-                _LOGGER.error("Authentification échouée: %s", auth_response[:200])
-                return False
-        except asyncio.TimeoutError:
-            _LOGGER.error("Timeout pendant l'authentification")
-            return False
+    # ──────────────────────────────────────────────────────────────────────
+    # Connexion + authentification
+    # ──────────────────────────────────────────────────────────────────────
 
     async def connect(self) -> bool:
-        """Établit la connexion WebSocket avec la box Tydom."""
-        url = TYDOM_URL.format(host=self.host, mac=self.mac)
-        
-        extra_headers = {
-            "Authorization": "Basic " + self._get_credentials(),
-        }
+        """
+        Ouvre le tunnel WSS puis exécute la poignée de main Digest.
 
+        Comportement selon les versions de websockets et firmwares Tydom :
+          - Tydom 1.0 / ancien firmware : la box accepte l'upgrade WS puis envoie
+            le 401 Digest DANS le tunnel (messages WS).
+          - Tydom 2.0 / nouveau firmware : la box renvoie HTTP 401 AVANT l'upgrade,
+            ce qui fait lever InvalidStatusCode à websockets. On récupère le nonce
+            depuis les headers de cette réponse 401, puis on se reconnecte avec
+            l'Authorization: Digest dans les headers de l'upgrade WS.
+        """
+        url = TYDOM_WS_URL.format(host=self.host, mac=self.mac)
+        _LOGGER.debug("Ouverture WSS vers %s", url)
+
+        # ── Tentative 1 : connexion sans auth (firmware Tydom 1.0) ────────
+        nonce_from_reject: str | None = None
         try:
-            _LOGGER.info("Connexion à Tydom: %s", url)
-            self._websocket = await asyncio.wait_for(
+            ws = await asyncio.wait_for(
                 websockets.connect(
                     url,
                     ssl=self._ssl_context,
-                    additional_headers=extra_headers,
-                    ping_interval=30,
-                    ping_timeout=10,
+                    ping_interval=None,
                     close_timeout=5,
+                    open_timeout=10,
                 ),
                 timeout=15,
             )
-            _LOGGER.info("Connexion WebSocket établie avec succès")
+            # Connexion acceptée → attendre le challenge 401 dans le tunnel
+            try:
+                challenge = await asyncio.wait_for(ws.recv(), timeout=10)
+                _LOGGER.debug("Challenge reçu dans tunnel : %s", challenge[:300])
+            except asyncio.TimeoutError:
+                _LOGGER.error("Pas de challenge reçu dans le tunnel (timeout 10 s)")
+                await ws.close()
+                return False
+
+            if "200 OK" in challenge:
+                # Déjà authentifié (reconnexion dans la même session TCP)
+                self._websocket = ws
+                _LOGGER.info("Tydom déjà authentifié (200 direct)")
+                return True
+
+            nonce = self._parse_nonce(challenge)
+            if not nonce:
+                _LOGGER.error("Challenge sans nonce reçu :\n%s", challenge)
+                await ws.close()
+                return False
+
+            _LOGGER.debug("Nonce (tunnel) : %s", nonce)
+            uri = f"/mediation/client?mac={self.mac}&appli=1"
+            auth_req = self._make_request(
+                "GET", uri,
+                extra_headers={"Authorization": self._digest_response(nonce)},
+            )
+            await ws.send(auth_req)
+
+            try:
+                auth_resp = await asyncio.wait_for(ws.recv(), timeout=10)
+                _LOGGER.debug("Réponse auth (tunnel) : %s", auth_resp[:300])
+            except asyncio.TimeoutError:
+                _LOGGER.error("Timeout en attendant la confirmation 200 OK (tunnel)")
+                await ws.close()
+                return False
+
+            if "200 OK" not in auth_resp:
+                _LOGGER.error(
+                    "Auth refusée dans le tunnel. Réponse :\n%s\n"
+                    "→ Vérifiez MAC (%s) et mot de passe.",
+                    auth_resp[:400], self.mac,
+                )
+                await ws.close()
+                return False
+
+            self._websocket = ws
+            _LOGGER.info("Auth Tydom OK (tunnel, MAC=%s)", self.mac)
             return True
-        except asyncio.TimeoutError:
-            _LOGGER.error("Timeout de connexion à %s", url)
-            return False
-        except Exception as err:
-            _LOGGER.error("Erreur de connexion: %s", err)
+
+        except Exception as first_err:
+            # Récupérer le nonce depuis les headers de la réponse 401 rejetée
+            nonce_from_reject = self._extract_nonce_from_exception(first_err)
+            if nonce_from_reject:
+                _LOGGER.debug(
+                    "401 reçu avant upgrade WS (firmware récent). "
+                    "Nonce extrait : %s", nonce_from_reject
+                )
+            else:
+                _LOGGER.error(
+                    "Connexion WSS échouée (tentative sans auth) : %s\n"
+                    "host=%s, MAC=%s", first_err, self.host, self.mac
+                )
+                return False
+
+        # ── Tentative 2 : upgrade WS avec Authorization: Digest ──────────
+        # (firmware Tydom 2.0 qui envoie 401 avant l'upgrade)
+        uri = f"/mediation/client?mac={self.mac}&appli=1"
+        digest_value = self._digest_response(nonce_from_reject)
+        _LOGGER.debug("Reconnexion avec Digest dans les headers WS upgrade")
+        try:
+            ws = await asyncio.wait_for(
+                websockets.connect(
+                    url,
+                    ssl=self._ssl_context,
+                    additional_headers={"Authorization": digest_value},
+                    ping_interval=None,
+                    close_timeout=5,
+                    open_timeout=10,
+                ),
+                timeout=15,
+            )
+        except Exception as second_err:
+            _LOGGER.error(
+                "Connexion WSS avec Digest échouée : %s\n"
+                "→ Vérifiez MAC (%s) et mot de passe.",
+                second_err, self.mac
+            )
             return False
 
+        # Attendre éventuellement un 200 dans le tunnel
+        try:
+            confirm = await asyncio.wait_for(ws.recv(), timeout=5)
+            _LOGGER.debug("Confirmation après auth header : %s", confirm[:200])
+        except asyncio.TimeoutError:
+            pass  # Certains firmwares n'envoient rien de plus
+
+        self._websocket = ws
+        _LOGGER.info("Auth Tydom OK (header upgrade, MAC=%s)", self.mac)
+        return True
+
+    @staticmethod
+    def _extract_nonce_from_exception(err: Exception) -> str | None:
+        """
+        Tente d'extraire le nonce depuis l'exception levée par websockets
+        quand la box répond 401 avant l'upgrade.
+        Compatible websockets >= 10 (InvalidStatusCode / RejectHandshake).
+        """
+        # websockets >= 10 : RejectHandshake ou InvalidStatusCode
+        # Les headers de la réponse 401 sont dans err.headers ou err.response.headers
+        headers_str = ""
+
+        # Attribut 'headers' direct (websockets 10-11)
+        if hasattr(err, "headers"):
+            try:
+                headers_str = str(err.headers)
+            except Exception:
+                pass
+
+        # Attribut 'response' (websockets 12+)
+        if not headers_str and hasattr(err, "response"):
+            try:
+                headers_str = str(err.response.headers)
+            except Exception:
+                pass
+
+        # Dernier recours : représentation texte de l'exception
+        if not headers_str:
+            headers_str = str(err)
+
+        nonce = re.search(r'[Nn]once="([^"]+)"', headers_str)
+        return nonce.group(1) if nonce else None
+
     async def disconnect(self) -> None:
-        """Ferme la connexion WebSocket."""
         self._running = False
         if self._websocket:
             try:
@@ -181,131 +301,133 @@ class TydomClient:
                 pass
             self._websocket = None
 
-    async def send_message(self, method: str, uri: str, body: dict | None = None) -> None:
-        """Envoie un message à la box Tydom."""
+    # ──────────────────────────────────────────────────────────────────────
+    # Envoi de commandes
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def send_message(self, method: str, uri: str,
+                           body: dict | list | None = None) -> None:
         if not self._websocket:
             raise ConnectionError("Non connecté à la box Tydom")
-        
-        body_str = json.dumps(body) if body else ""
-        request = self._build_http_request(method, uri, body_str)
-        
+        body_str = json.dumps(body) if body is not None else ""
+        raw = self._make_request(method, uri, body=body_str)
         try:
-            await self._websocket.send(request)
-            _LOGGER.debug("Message envoyé: %s %s", method, uri)
+            await self._websocket.send(raw)
+            _LOGGER.debug("→ %s %s", method, uri)
         except ConnectionClosed:
-            _LOGGER.error("Connexion fermée lors de l'envoi")
+            _LOGGER.warning("Connexion fermée pendant l'envoi")
+            self._websocket = None
             raise
 
     async def get_devices(self) -> None:
-        """Demande les données de tous les équipements."""
         await self.send_message("GET", CMD_GET_DEVICES)
 
     async def get_configs(self) -> None:
-        """Demande la configuration de tous les équipements."""
         await self.send_message("GET", CMD_GET_CONFIGS)
 
     async def get_info(self) -> None:
-        """Demande les informations de la box."""
         await self.send_message("GET", CMD_GET_INFOS)
 
     async def refresh_all(self) -> None:
-        """Demande un rafraîchissement de tous les équipements."""
         await self.send_message("POST", CMD_POST_REFRESH)
 
-    async def set_device_data(self, device_id: str, endpoint_id: str, data: list) -> None:
-        """Envoie une commande à un équipement."""
+    async def set_device_data(self, device_id: str, endpoint_id: str,
+                              data: list) -> None:
         uri = f"/devices/{device_id}/endpoints/{endpoint_id}/data"
         await self.send_message("PUT", uri, data)
 
-    def _parse_response(self, raw: str) -> dict | list | None:
-        """Parse une réponse HTTP Tydom."""
-        try:
-            # Chercher le body JSON après les headers HTTP
-            parts = raw.split("\r\n\r\n", 1)
-            if len(parts) < 2:
-                return None
-            
-            body = parts[1].strip()
-            if not body:
-                return None
-
-            # Gérer le chunked encoding
-            if "\r\n" in body:
-                lines = body.split("\r\n")
-                body = "".join(
-                    line for line in lines 
-                    if not all(c in "0123456789abcdefABCDEF" for c in line.strip()) or not line.strip()
-                )
-
-            return json.loads(body)
-        except (json.JSONDecodeError, ValueError) as err:
-            _LOGGER.debug("Impossible de parser la réponse JSON: %s", err)
-            return None
+    # ──────────────────────────────────────────────────────────────────────
+    # Boucle d'écoute
+    # ──────────────────────────────────────────────────────────────────────
 
     async def listen(self) -> None:
-        """Écoute les messages entrants de la box Tydom."""
+        """Reçoit les messages Tydom en continu et appelle le callback."""
         self._running = True
-        
+
         while self._running:
+            # Reconnexion si nécessaire
             if not self._websocket:
-                _LOGGER.warning("WebSocket non connecté, tentative de reconnexion...")
-                success = await self.connect()
-                if not success:
-                    await asyncio.sleep(30)
+                _LOGGER.info("Reconnexion Tydom…")
+                ok = await self.connect()
+                if not ok:
+                    await asyncio.sleep(RECONNECT_DELAY)
                     continue
-                # Demander les données initiales
-                await self.get_devices()
-                await self.get_configs()
+                try:
+                    await self.get_devices()
+                    await self.get_configs()
+                except Exception:
+                    pass
 
             try:
-                raw_message = await asyncio.wait_for(
-                    self._websocket.recv(), timeout=60
+                raw = await asyncio.wait_for(
+                    self._websocket.recv(), timeout=70
                 )
-                
-                _LOGGER.debug("Message brut reçu: %s", raw_message[:500])
-                
-                parsed = self._parse_response(raw_message)
-                if parsed and self.callback:
-                    # Extraire le type depuis les headers HTTP
-                    msg_type = self._extract_msg_type(raw_message)
+                _LOGGER.debug("← %s…", raw[:200])
+
+                parsed = self._parse_response(raw)
+                if parsed is not None and self.callback:
+                    msg_type = self._msg_type(raw)
                     await self.callback(msg_type, parsed)
 
             except asyncio.TimeoutError:
-                # Envoyer un ping pour maintenir la connexion
+                # keepalive
                 try:
                     await self.send_message("GET", CMD_GET_INFOS)
                 except Exception:
                     self._websocket = None
+
             except ConnectionClosed:
-                _LOGGER.warning("Connexion WebSocket fermée, reconnexion...")
+                _LOGGER.warning("Tunnel WS fermé, reconnexion dans %ds", RECONNECT_DELAY)
                 self._websocket = None
-                await asyncio.sleep(5)
+                await asyncio.sleep(RECONNECT_DELAY)
+
             except Exception as err:
-                _LOGGER.error("Erreur lors de la réception: %s", err)
+                _LOGGER.error("Erreur inattendue dans listen() : %s", err)
                 await asyncio.sleep(5)
 
-    def _extract_msg_type(self, raw: str) -> str:
-        """Extrait le type de message depuis l'URI HTTP."""
+    # ──────────────────────────────────────────────────────────────────────
+    # Helpers parsing
+    # ──────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _parse_response(raw: str) -> dict | list | None:
+        """Extrait le JSON du body d'une réponse HTTP-dans-WS."""
         try:
-            first_line = raw.split("\r\n")[0]
-            if CMD_GET_DEVICES in first_line or "/devices/" in first_line:
-                return "devices_data"
-            elif CMD_GET_CONFIGS in first_line:
-                return "devices_config"
-            elif CMD_GET_META in first_line:
-                return "devices_meta"
-            elif CMD_GET_INFOS in first_line:
-                return "info"
-            elif "PUT" in first_line:
-                return "put_response"
-        except Exception:
-            pass
+            _, _, body = raw.partition("\r\n\r\n")
+            body = body.strip()
+            if not body:
+                return None
+            # Dé-chunking basique : supprimer les lignes de taille hexa
+            lines = body.splitlines()
+            clean = []
+            for line in lines:
+                stripped = line.strip()
+                if re.fullmatch(r"[0-9a-fA-F]+", stripped):
+                    continue      # ligne de taille chunk
+                if stripped == "0":
+                    break         # fin de chunked
+                clean.append(line)
+            body = "\n".join(clean).strip()
+            if not body:
+                return None
+            return json.loads(body)
+        except (json.JSONDecodeError, ValueError):
+            return None
+
+    @staticmethod
+    def _msg_type(raw: str) -> str:
+        """Détermine le type de message depuis la première ligne HTTP."""
+        first = raw.split("\r\n", 1)[0]
+        if "/devices/data"    in first: return "devices_data"
+        if "/devices/cconfig" in first: return "devices_config"
+        if "/devices/meta"    in first: return "devices_meta"
+        if "/infos"           in first: return "info"
+        if "PUT"              in first: return "put_response"
         return "unknown"
 
     async def ping(self) -> bool:
-        """Teste la connexion avec la box Tydom."""
         try:
-            await self.get_info()
+            await self.send_message("GET", CMD_GET_INFOS)
             return True
         except Exception:
             return False
