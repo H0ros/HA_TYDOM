@@ -39,7 +39,7 @@ Supporte les **volets roulants**, portails, lumières, interrupteurs, thermostat
 2. Cliquez sur les **3 points** (menu) en haut à droite
 3. Sélectionnez **Dépôts personnalisés**
 4. Remplissez le formulaire :
-   - **URL** : `https://github.com/VOTRE_USERNAME/ha-tydom`
+   - **URL** : `https://github.com/H0ros/HA_TYDOM`
    - **Catégorie** : `Intégration`
 5. Cliquez sur **Ajouter**
 
@@ -72,7 +72,7 @@ Supporte les **volets roulants**, portails, lumières, interrupteurs, thermostat
 
 1. Téléchargez le dépôt :
    ```bash
-   git clone https://github.com/VOTRE_USERNAME/ha-tydom.git
+   git clone https://github.com/H0ros/HA_TYDOM.git
    ```
 
 2. Copiez le dossier dans Home Assistant :
@@ -82,7 +82,7 @@ Supporte les **volets roulants**, portails, lumières, interrupteurs, thermostat
    Ou via le module **SSH & Web Terminal** de HA :
    ```bash
    cd /config/custom_components
-   git clone https://github.com/VOTRE_USERNAME/ha-tydom.git temp_tydom
+   git clone https://github.com/H0ros/HA_TYDOM.git temp_tydom
    mv temp_tydom/custom_components/tydom .
    rm -rf temp_tydom
    ```
@@ -116,7 +116,7 @@ cd ha-tydom
 git add .
 git commit -m "feat: initial release Tydom integration"
 git branch -M main
-git remote add origin https://github.com/VOTRE_USERNAME/ha-tydom.git
+git remote add origin https://github.com/H0ros/HA_TYDOM.git
 git push -u origin main
 
 # 5. Créer un tag de release (requis par HACS)
