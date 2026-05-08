@@ -123,7 +123,11 @@ class TydomClient:
         return "\r\n".join(lines)
 
     @staticmethod
-    def _parse_www_authenticate(raw: str) -> dict[str, str]:
+    def _generate_websocket_key() -> str:
+        """Génère une clé Sec-WebSocket-Key aléatoire."""
+        import base64
+        import os
+        return base64.b64encode(os.urandom(16)).decode('utf-8')
         """Extrait les paramètres d'un challenge WWW-Authenticate: Digest."""
         auth_match = re.search(r'WWW-Authenticate:\s*Digest\s*(.*)', raw, re.IGNORECASE)
         challenge = auth_match.group(1) if auth_match else raw
@@ -158,7 +162,7 @@ class TydomClient:
         # Initialiser les attributs thread_local attendus par HTTPDigestAuth
         digest_auth._thread_local.chal = chal
         digest_auth._thread_local.last_nonce = nonce
-        digest_auth._thread_local.nonce_count = 0  # build_digest_header l'incrémente avant de l'utiliser
+        digest_auth._thread_local.nonce_count = 1  # Comme tydom2mqtt
         digest_auth._thread_local.last_method = "GET"
         digest_auth._thread_local.num_401_calls = 0
         
@@ -175,6 +179,16 @@ class TydomClient:
             "Digest response (via HTTPDigestAuth): nonce=%s, realm=%s, qop=%s, auth_header=%s",
             nonce, realm, qop, auth_header[:100],
         )
+        
+        # Debug: calcul manuel pour vérification
+        import hashlib
+        ha1 = hashlib.md5(f"{self.mac}:{realm}:{self.password}".encode()).hexdigest()
+        ha2 = hashlib.md5(f"GET:{full_uri}".encode()).hexdigest()
+        # Le cnonce sera dans le header, on peut l'extraire
+        cnonce_match = re.search(r'cnonce="([^"]+)"', auth_header)
+        actual_cnonce = cnonce_match.group(1) if cnonce_match else "unknown"
+        manual_response = hashlib.md5(f"{ha1}:{nonce}:00000001:{actual_cnonce}:auth:{ha2}".encode()).hexdigest()
+        _LOGGER.debug("Manual hash calc: HA1=%s, HA2=%s, cnonce=%s, response=%s", ha1, ha2, actual_cnonce, manual_response)
         
         return auth_header
 
@@ -198,8 +212,46 @@ class TydomClient:
         _LOGGER.debug("Ouverture WSS vers %s", url)
 
         # ── Tentative 1 : connexion sans auth (firmware Tydom 1.0) ────────
-        nonce_from_reject: str | None = None
+        # D'abord faire une requête HTTP GET pour obtenir le challenge
+        import http.client
+        conn = http.client.HTTPSConnection(self.host, 443, context=self._ssl_context)
         try:
+            conn.request("GET", f"/mediation/client?mac={self.mac}&appli=1", None, {
+                "Connection": "Upgrade",
+                "Upgrade": "websocket",
+                "Host": f"{self.host}:443",
+                "Accept": "*/*",
+                "Sec-WebSocket-Key": self._generate_websocket_key(),
+                "Sec-WebSocket-Version": "13",
+            })
+            res = conn.getresponse()
+            conn.close()
+            
+            # Si 401, extraire le challenge et faire l'upgrade WS avec Digest
+            if res.status == 401:
+                auth_params = self._parse_www_authenticate(str(res.headers))
+                nonce = auth_params.get("nonce")
+                realm = auth_params.get("realm")
+                if nonce and realm:
+                    _LOGGER.info("Challenge HTTP GET - realm=%s, nonce=%s, qop=%s", 
+                                 realm, nonce, auth_params.get("qop"))
+                    
+                    # Calculer Digest et faire l'upgrade WS
+                    digest_value = self._digest_response(nonce, realm, qop=auth_params.get("qop"))
+                    ws = await asyncio.wait_for(
+                        websockets.connect(
+                            url,
+                            ssl=self._ssl_context,
+                            additional_headers={"Authorization": digest_value},
+                            ping_interval=None,
+                            close_timeout=5,
+                            open_timeout=10,
+                        ),
+                        timeout=15,
+                    )
+                    self._websocket = ws
+                    _LOGGER.info("Auth Tydom OK (HTTP GET + WS upgrade, MAC=%s)", self.mac)
+                    return True
             ws = await asyncio.wait_for(
                 websockets.connect(
                     url,
@@ -287,10 +339,36 @@ class TydomClient:
             auth_params = self._extract_www_authenticate_from_exception(first_err)
             nonce_from_reject = auth_params.get("nonce")
             if nonce_from_reject:
-                _LOGGER.debug(
-                    "401 reçu avant upgrade WS (firmware récent). "
-                    "Nonce extrait : %s", nonce_from_reject
-                )
+                _LOGGER.info("Tentative 2 - Challenge extrait: realm=%s, nonce=%s, qop=%s, opaque=%s, algorithm=%s", 
+                             auth_params.get("realm"), nonce_from_reject, auth_params.get("qop"), auth_params.get("opaque"), auth_params.get("algorithm"))
+                
+                # Debug: simuler l'extraction tydom2mqtt pour tentative 2
+                try:
+                    headers_str = ""
+                    if hasattr(first_err, "headers"):
+                        headers_str = str(first_err.headers)
+                    elif hasattr(first_err, "response"):
+                        headers_str = str(first_err.response.headers)
+                    else:
+                        headers_str = str(first_err)
+                    
+                    _LOGGER.debug("Tentative 2 - Headers string: %s", headers_str[:300])
+                    
+                    # Essayer la méthode tydom2mqtt
+                    www_auth_match = re.search(r'WWW-Authenticate:\s*Digest\s*(.*)', headers_str, re.IGNORECASE)
+                    if www_auth_match:
+                        digest_part = www_auth_match.group(1)
+                        _LOGGER.debug("Tentative 2 - Digest part: %s", digest_part)
+                        
+                        # Méthode tydom2mqtt: split sur virgule et prendre le 3ème élément
+                        parts = digest_part.split(",", 3)
+                        if len(parts) >= 3:
+                            nonce_part = parts[2].strip()
+                            if "=" in nonce_part:
+                                tydom2mqtt_nonce = nonce_part.split("=", 1)[1].strip().strip('"')
+                                _LOGGER.info("Tentative 2 - tydom2mqtt nonce extraction: '%s' (vs notre: '%s')", tydom2mqtt_nonce, nonce_from_reject)
+                except Exception as e:
+                    _LOGGER.debug("Tentative 2 - Erreur extraction nonce tydom2mqtt: %s", e)
             else:
                 _LOGGER.error(
                     "Connexion WSS échouée (tentative sans auth) : %s\n"
