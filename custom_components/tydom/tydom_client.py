@@ -15,6 +15,7 @@ import json
 import logging
 import re
 import ssl
+import uuid
 from typing import Any, Callable
 
 import websockets
@@ -27,8 +28,8 @@ TYDOM_MDNS = "{mac_lower}-tydom.local"
 # URL WebSocket — pas de credentials dans l'URL
 TYDOM_WS_URL = "wss://{host}/mediation/client?mac={mac}&appli=1"
 
-# Realm fixe de la box Tydom
-TYDOM_REALM = "MDCOM"
+# Realm fixe de la box Tydom (compatible tydom2mqtt)
+TYDOM_REALM = "protected area"
 
 # Commandes internes Tydom (envoyées comme requêtes HTTP dans le tunnel WS)
 CMD_GET_DEVICES = "/devices/data"
@@ -62,6 +63,7 @@ class TydomClient:
         self._running = False
         self._msg_id = 0
         self._ssl_context = self._make_ssl_context()
+        self._nonce_count = 0  # Pour Digest auth avec qop
 
     # ──────────────────────────────────────────────────────────────────────
     # SSL
@@ -127,21 +129,41 @@ class TydomClient:
         m = re.search(r'[Nn]once="([^"]+)"', raw)
         return m.group(1) if m else None
 
-    def _digest_response(self, nonce: str) -> str:
+    def _digest_response(self, nonce: str, uri: str | None = None) -> str:
         """
-        Calcule la réponse HTTP Digest (RFC 2617, sans qop).
-        HA1 = MD5(username:realm:password)
-        HA2 = MD5(method:uri)
-        response = MD5(HA1:nonce:HA2)
+        Calcule la réponse HTTP Digest (RFC 2617 avec qop=auth).
+        
+        Compatible avec tydom2mqtt qui utilise :
+        - qop="auth" (obligatoire pour nc et cnonce)
+        - nc=nonce_count formaté en hexadécimal 8 caractères
+        - cnonce=UUID générée
+        - URI : par défaut URI complète https://{host}:443/mediation/client?mac={mac}&appli=1
+               sinon l'URI passée en paramètre
         """
-        uri = f"/mediation/client?mac={self.mac}&appli=1"
+        self._nonce_count += 1
+        nc = f"{self._nonce_count:08x}"  # Format hex 8 chars: "00000001"
+        cnonce = str(uuid.uuid4())  # UUID comme cnonce
+        qop = "auth"
+        
+        # URI pour le calcul du digest
+        if uri is None:
+            # Valeur par défaut : URI complète (tentative 2, headers WebSocket)
+            uri = f"https://{self.host}:443/mediation/client?mac={self.mac}&appli=1"
+        
+        # RFC 2617 avec qop=auth :
+        # HA1 = MD5(username:realm:password)
+        # HA2 = MD5(method:uri)
+        # response = MD5(HA1:nonce:nc:cnonce:qop:HA2)
         ha1 = hashlib.md5(f"{self.mac}:{TYDOM_REALM}:{self.password}".encode()).hexdigest()
         ha2 = hashlib.md5(f"GET:{uri}".encode()).hexdigest()
-        response = hashlib.md5(f"{ha1}:{nonce}:{ha2}".encode()).hexdigest()
+        response = hashlib.md5(
+            f"{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}".encode()
+        ).hexdigest()
         
         _LOGGER.debug(
-            "Digest calculation: MAC=%s, nonce=%s, ha1=%s, ha2=%s, response=%s",
-            self.mac, nonce, ha1, ha2, response
+            "Digest calculation (qop=auth): MAC=%s, nonce=%s, nc=%s, "
+            "cnonce=%s, uri=%s, ha1=%s, ha2=%s, response=%s",
+            self.mac, nonce, nc, cnonce, uri, ha1, ha2, response
         )
         
         return (
@@ -149,6 +171,9 @@ class TydomClient:
             f'realm="{TYDOM_REALM}", '
             f'nonce="{nonce}", '
             f'uri="{uri}", '
+            f'qop={qop}, '
+            f'nc={nc}, '
+            f'cnonce="{cnonce}", '
             f'response="{response}"'
         )
 
@@ -209,7 +234,7 @@ class TydomClient:
             uri = f"/mediation/client?mac={self.mac}&appli=1"
             auth_req = self._make_request(
                 "GET", uri,
-                extra_headers={"Authorization": self._digest_response(nonce)},
+                extra_headers={"Authorization": self._digest_response(nonce, uri)},
             )
             await ws.send(auth_req)
 
@@ -256,10 +281,9 @@ class TydomClient:
 
         # ── Tentative 2 : upgrade WS avec Authorization: Digest ──────────
         # (firmware Tydom 2.0 qui envoie 401 avant l'upgrade)
-        uri = f"/mediation/client?mac={self.mac}&appli=1"
         digest_value = self._digest_response(nonce_from_reject)
         _LOGGER.debug(
-            "Reconnexion avec Digest dans les headers WS upgrade. "
+            "Reconnexion avec Digest (qop=auth) dans les headers WS upgrade. "
             "Nonce=%s, Digest=%s",
             nonce_from_reject, digest_value
         )
