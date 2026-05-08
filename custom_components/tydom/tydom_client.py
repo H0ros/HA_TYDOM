@@ -147,8 +147,9 @@ class TydomClient:
         
         # URI pour le calcul du digest
         if uri is None:
-            # Valeur par défaut : URI complète (tentative 2, headers WebSocket)
-            uri = f"https://{self.host}:443/mediation/client?mac={self.mac}&appli=1"
+            # Valeur par défaut : chemin de requête, selon RFC 2617.
+            # La box Tydom attend /mediation/client?mac=...&appli=1, pas l'URL absolue.
+            uri = f"/mediation/client?mac={self.mac}&appli=1"
         
         # RFC 2617 avec qop=auth :
         # HA1 = MD5(username:realm:password)
