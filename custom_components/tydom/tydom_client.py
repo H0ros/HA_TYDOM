@@ -18,9 +18,7 @@ import ssl
 import uuid
 from typing import Any, Callable
 
-import websockets
-from websockets.exceptions import ConnectionClosed
-from requests.auth import HTTPDigestAuth
+import aiohttp
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -123,11 +121,16 @@ class TydomClient:
         return "\r\n".join(lines)
 
     @staticmethod
-    def _generate_websocket_key() -> str:
-        """Génère une clé Sec-WebSocket-Key aléatoire."""
-        import base64
-        import os
-        return base64.b64encode(os.urandom(16)).decode('utf-8')
+    def _parse_www_authenticate(raw: str) -> dict[str, str]:
+        """Extrait les paramètres d'un challenge WWW-Authenticate: Digest."""
+        auth_match = re.search(r'WWW-Authenticate:\s*Digest\s*(.*)', raw, re.IGNORECASE)
+        challenge = auth_match.group(1) if auth_match else raw
+        params: dict[str, str] = {}
+        for name, _, quoted, unquoted in re.findall(
+            r'([a-zA-Z]+)=("([^"]*)"|([^,]*))(?:,\s*)?', challenge
+        ):
+            params[name.lower()] = quoted or unquoted.strip()
+        return params
         """Extrait les paramètres d'un challenge WWW-Authenticate: Digest."""
         auth_match = re.search(r'WWW-Authenticate:\s*Digest\s*(.*)', raw, re.IGNORECASE)
         challenge = auth_match.group(1) if auth_match else raw
@@ -213,45 +216,47 @@ class TydomClient:
 
         # ── Tentative 1 : connexion sans auth (firmware Tydom 1.0) ────────
         # D'abord faire une requête HTTP GET pour obtenir le challenge
-        import http.client
-        conn = http.client.HTTPSConnection(self.host, 443, context=self._ssl_context)
         try:
-            conn.request("GET", f"/mediation/client?mac={self.mac}&appli=1", None, {
-                "Connection": "Upgrade",
-                "Upgrade": "websocket",
-                "Host": f"{self.host}:443",
-                "Accept": "*/*",
-                "Sec-WebSocket-Key": self._generate_websocket_key(),
-                "Sec-WebSocket-Version": "13",
-            })
-            res = conn.getresponse()
-            conn.close()
-            
-            # Si 401, extraire le challenge et faire l'upgrade WS avec Digest
-            if res.status == 401:
-                auth_params = self._parse_www_authenticate(str(res.headers))
-                nonce = auth_params.get("nonce")
-                realm = auth_params.get("realm")
-                if nonce and realm:
-                    _LOGGER.info("Challenge HTTP GET - realm=%s, nonce=%s, qop=%s", 
-                                 realm, nonce, auth_params.get("qop"))
-                    
-                    # Calculer Digest et faire l'upgrade WS
-                    digest_value = self._digest_response(nonce, realm, qop=auth_params.get("qop"))
-                    ws = await asyncio.wait_for(
-                        websockets.connect(
-                            url,
-                            ssl=self._ssl_context,
-                            additional_headers={"Authorization": digest_value},
-                            ping_interval=None,
-                            close_timeout=5,
-                            open_timeout=10,
-                        ),
-                        timeout=15,
-                    )
-                    self._websocket = ws
-                    _LOGGER.info("Auth Tydom OK (HTTP GET + WS upgrade, MAC=%s)", self.mac)
-                    return True
+            async with aiohttp.ClientSession() as session:
+                headers = {
+                    "Connection": "Upgrade",
+                    "Upgrade": "websocket",
+                    "Host": f"{self.host}:443",
+                    "Accept": "*/*",
+                    "Sec-WebSocket-Key": self._generate_websocket_key(),
+                    "Sec-WebSocket-Version": "13",
+                }
+                async with session.get(
+                    f"https://{self.host}:443/mediation/client?mac={self.mac}&appli=1",
+                    headers=headers,
+                    ssl=self._ssl_context
+                ) as resp:
+                    # Si 401, extraire le challenge et faire l'upgrade WS avec Digest
+                    if resp.status == 401:
+                        www_auth = resp.headers.get('WWW-Authenticate', '')
+                        auth_params = self._parse_www_authenticate(www_auth)
+                        nonce = auth_params.get("nonce")
+                        realm = auth_params.get("realm")
+                        if nonce and realm:
+                            _LOGGER.info("Challenge HTTP GET - realm=%s, nonce=%s, qop=%s", 
+                                         realm, nonce, auth_params.get("qop"))
+                            
+                            # Calculer Digest et faire l'upgrade WS
+                            digest_value = self._digest_response(nonce, realm, qop=auth_params.get("qop"))
+                            ws = await asyncio.wait_for(
+                                websockets.connect(
+                                    url,
+                                    ssl=self._ssl_context,
+                                    additional_headers={"Authorization": digest_value},
+                                    ping_interval=None,
+                                    close_timeout=5,
+                                    open_timeout=10,
+                                ),
+                                timeout=15,
+                            )
+                            self._websocket = ws
+                            _LOGGER.info("Auth Tydom OK (HTTP GET + WS upgrade, MAC=%s)", self.mac)
+                            return True
             ws = await asyncio.wait_for(
                 websockets.connect(
                     url,
@@ -471,7 +476,7 @@ class TydomClient:
             _LOGGER.debug("Digest auth search: using exception string representation")
 
         _LOGGER.debug("Digest auth search: headers_str=%s", headers_str[:500])
-        auth_params = TydomClient._parse_www_authenticate(headers_str)
+        auth_params = self._parse_www_authenticate(headers_str)
         if auth_params:
             _LOGGER.debug("Digest auth params found: %s", auth_params)
             return auth_params
