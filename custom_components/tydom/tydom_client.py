@@ -20,6 +20,7 @@ from typing import Any, Callable
 
 import websockets
 from websockets.exceptions import ConnectionClosed
+from requests.auth import HTTPDigestAuth
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -137,64 +138,37 @@ class TydomClient:
     def _digest_response(
         self,
         nonce: str,
-        uri: str | None = None,
-        realm: str | None = None,
-        opaque: str | None = None,
-        algorithm: str | None = None,
-        qop: str = "auth",
+        realm: str,
+        qop: str | None = None,
     ) -> str:
         """
-        Calcule la réponse HTTP Digest (RFC 2617).
+        Calcule la réponse HTTP Digest (RFC 2617) using requests.HTTPDigestAuth.
 
-        Compatible avec tydom2mqtt qui utilise :
-        - qop="auth" (obligatoire pour nc et cnonce)
-        - nc=nonce_count formaté en hexadécimal 8 caractères
-        - cnonce=UUID générée
-        - URI : par défaut le chemin de requête /mediation/client?mac=...&appli=1
+        Compatible tydom2mqtt qui utilise HTTPDigestAuth de requests.
         """
-        self._nonce_count += 1
-        nc = f"{self._nonce_count:08x}"
-        cnonce = str(uuid.uuid4())
-        realm = realm or TYDOM_REALM
-        algorithm = algorithm or "MD5"
-
-        if uri is None:
-            uri = f"/mediation/client?mac={self.mac}&appli=1"
-
-        ha1 = hashlib.md5(f"{self.mac}:{realm}:{self.password}".encode()).hexdigest()
-        ha2 = hashlib.md5(f"GET:{uri}".encode()).hexdigest()
-
+        # Créer une instance de HTTPDigestAuth avec username=MAC et password
+        digest_auth = HTTPDigestAuth(self.mac, self.password)
+        
+        # Construire le challenge comme l'attend HTTPDigestAuth
+        chal = {}
+        chal["nonce"] = nonce
+        chal["realm"] = realm
         if qop:
-            response = hashlib.md5(
-                f"{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}".encode()
-            ).hexdigest()
-        else:
-            response = hashlib.md5(f"{ha1}:{nonce}:{ha2}".encode()).hexdigest()
-
+            chal["qop"] = qop
+        
+        digest_auth._thread_local.chal = chal
+        digest_auth._thread_local.nonce_count = 1
+        
+        # Build digest header pour l'URI complète
+        full_uri = f"https://{self.host}:443/mediation/client?mac={self.mac}&appli=1"
+        auth_header = digest_auth.build_digest_header("GET", full_uri)
+        
         _LOGGER.debug(
-            "Digest calculation: MAC=%s, realm=%s, nonce=%s, nc=%s, cnonce=%s, uri=%s, qop=%s, ha1=%s, ha2=%s, response=%s",
-            self.mac, realm, nonce, nc, cnonce, uri, qop, ha1, ha2, response,
+            "Digest response (via HTTPDigestAuth): nonce=%s, realm=%s, qop=%s, auth_header=%s",
+            nonce, realm, qop, auth_header[:100],
         )
-
-        header_parts = [
-            f'Digest username="{self.mac}"',
-            f'realm="{realm}"',
-            f'nonce="{nonce}"',
-            f'uri="{uri}"',
-        ]
-        if algorithm:
-            header_parts.append(f'algorithm={algorithm}')
-        if qop:
-            header_parts.extend([
-                f'qop={qop}',
-                f'nc={nc}',
-                f'cnonce="{cnonce}"',
-            ])
-        header_parts.append(f'response="{response}"')
-        if opaque:
-            header_parts.append(f'opaque="{opaque}"')
-
-        return ", ".join(header_parts)
+        
+        return auth_header
 
     # ──────────────────────────────────────────────────────────────────────
     # Connexion + authentification
@@ -245,23 +219,21 @@ class TydomClient:
 
             auth_params = self._parse_www_authenticate(challenge)
             nonce = auth_params.get("nonce")
-            if not nonce:
-                _LOGGER.error("Challenge sans nonce reçu :\n%s", challenge)
+            realm = auth_params.get("realm")
+            if not nonce or not realm:
+                _LOGGER.error("Challenge sans nonce/realm reçu :\n%s", challenge)
                 await ws.close()
                 return False
 
-            _LOGGER.debug("Nonce (tunnel) : %s", nonce)
-            uri = f"/mediation/client?mac={self.mac}&appli=1"
+            _LOGGER.debug("Challenge params - nonce=%s, realm=%s, qop=%s", nonce, realm, auth_params.get("qop"))
+            uri_path = f"/mediation/client?mac={self.mac}&appli=1"
             auth_req = self._make_request(
-                "GET", uri,
+                "GET", uri_path,
                 extra_headers={
                     "Authorization": self._digest_response(
                         nonce,
-                        uri,
-                        realm=auth_params.get("realm"),
-                        opaque=auth_params.get("opaque"),
-                        algorithm=auth_params.get("algorithm"),
-                        qop=auth_params.get("qop", "auth"),
+                        realm,
+                        qop=auth_params.get("qop"),
                     )
                 },
             )
@@ -311,12 +283,11 @@ class TydomClient:
 
         # ── Tentative 2 : upgrade WS avec Authorization: Digest ──────────
         # (firmware Tydom 2.0 qui envoie 401 avant l'upgrade)
+        realm_reject = auth_params.get("realm") or TYDOM_REALM
         digest_value = self._digest_response(
             nonce_from_reject,
-            realm=auth_params.get("realm"),
-            opaque=auth_params.get("opaque"),
-            algorithm=auth_params.get("algorithm"),
-            qop=auth_params.get("qop", "auth"),
+            realm_reject,
+            qop=auth_params.get("qop"),
         )
         _LOGGER.debug(
             "Reconnexion avec Digest (qop=auth) dans les headers WS upgrade. "
