@@ -156,8 +156,12 @@ class TydomClient:
         if qop:
             chal["qop"] = qop
         
+        # Initialiser les attributs thread_local attendus par HTTPDigestAuth
         digest_auth._thread_local.chal = chal
+        digest_auth._thread_local.last_nonce = nonce
         digest_auth._thread_local.nonce_count = 1
+        digest_auth._thread_local.last_method = "GET"
+        digest_auth._thread_local.num_401_calls = 0
         
         # Build digest header pour l'URI complète
         full_uri = f"https://{self.host}:443/mediation/client?mac={self.mac}&appli=1"
