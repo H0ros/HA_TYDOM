@@ -151,7 +151,7 @@ class TydomClient:
         # Construire le challenge comme l'attend HTTPDigestAuth
         chal = {}
         chal["nonce"] = nonce
-        chal["realm"] = realm
+        chal["realm"] = realm.lower()  # tydom2mqtt utilise "protected area" en minuscules pour mode local
         if qop:
             chal["qop"] = qop
         
@@ -165,6 +165,11 @@ class TydomClient:
         # Build digest header pour l'URI complète
         full_uri = f"https://{self.host}:443/mediation/client?mac={self.mac}&appli=1"
         auth_header = digest_auth.build_digest_header("GET", full_uri)
+        
+        _LOGGER.debug(
+            "Digest response (via HTTPDigestAuth): nonce=%s, realm=%s, qop=%s, auth_header=%s",
+            nonce, realm, qop, auth_header[:100],
+        )
         
         _LOGGER.debug(
             "Digest response (via HTTPDigestAuth): nonce=%s, realm=%s, qop=%s, auth_header=%s",
@@ -230,6 +235,15 @@ class TydomClient:
 
             _LOGGER.info("Challenge reçu - realm=%s, nonce=%s, qop=%s, opaque=%s, algorithm=%s", 
                          realm, nonce, auth_params.get("qop"), auth_params.get("opaque"), auth_params.get("algorithm"))
+            
+            # Debug: simuler l'extraction tydom2mqtt
+            try:
+                nonce_parts = challenge.split(",", 3)
+                if len(nonce_parts) >= 3:
+                    tydom2mqtt_nonce = nonce_parts[2].split("=", 1)[1].split('"')[1]
+                    _LOGGER.info("tydom2mqtt nonce extraction: %s (vs notre: %s)", tydom2mqtt_nonce, nonce)
+            except Exception as e:
+                _LOGGER.debug("Erreur extraction nonce tydom2mqtt: %s", e)
             uri_path = f"/mediation/client?mac={self.mac}&appli=1"
             auth_req = self._make_request(
                 "GET", uri_path,
@@ -288,6 +302,26 @@ class TydomClient:
         # ── Tentative 2 : upgrade WS avec Authorization: Digest ──────────
         # (firmware Tydom 2.0 qui envoie 401 avant l'upgrade)
         realm_reject = auth_params.get("realm") or TYDOM_REALM
+        _LOGGER.info("Tentative 2 - realm=%s, nonce=%s, qop=%s, opaque=%s, algorithm=%s", 
+                     realm_reject, nonce_from_reject, auth_params.get("qop"), auth_params.get("opaque"), auth_params.get("algorithm"))
+        
+        # Debug: simuler l'extraction tydom2mqtt pour tentative 2
+        try:
+            headers_str = ""
+            if hasattr(first_err, "headers"):
+                headers_str = str(first_err.headers)
+            elif hasattr(first_err, "response"):
+                headers_str = str(first_err.response.headers)
+            else:
+                headers_str = str(first_err)
+            
+            nonce_parts = headers_str.split(",", 3)
+            if len(nonce_parts) >= 3:
+                tydom2mqtt_nonce_2 = nonce_parts[2].split("=", 1)[1].split('"')[1]
+                _LOGGER.info("Tentative 2 - tydom2mqtt nonce extraction: %s (vs notre: %s)", tydom2mqtt_nonce_2, nonce_from_reject)
+        except Exception as e:
+            _LOGGER.debug("Tentative 2 - Erreur extraction nonce tydom2mqtt: %s", e)
+        
         digest_value = self._digest_response(
             nonce_from_reject,
             realm_reject,
