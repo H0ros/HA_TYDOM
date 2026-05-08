@@ -64,7 +64,6 @@ class TydomClient:
         self._running = False
         self._msg_id = 0
         self._ssl_context = self._make_ssl_context()
-        self._nonce_count = 0  # Pour Digest auth avec qop
 
     # ──────────────────────────────────────────────────────────────────────
     # SSL
@@ -159,7 +158,7 @@ class TydomClient:
         # Initialiser les attributs thread_local attendus par HTTPDigestAuth
         digest_auth._thread_local.chal = chal
         digest_auth._thread_local.last_nonce = nonce
-        digest_auth._thread_local.nonce_count = 1
+        digest_auth._thread_local.nonce_count = 0  # build_digest_header l'incrémente avant de l'utiliser
         digest_auth._thread_local.last_method = "GET"
         digest_auth._thread_local.num_401_calls = 0
         
@@ -229,7 +228,8 @@ class TydomClient:
                 await ws.close()
                 return False
 
-            _LOGGER.debug("Challenge params - nonce=%s, realm=%s, qop=%s", nonce, realm, auth_params.get("qop"))
+            _LOGGER.info("Challenge reçu - realm=%s, nonce=%s, qop=%s, opaque=%s, algorithm=%s", 
+                         realm, nonce, auth_params.get("qop"), auth_params.get("opaque"), auth_params.get("algorithm"))
             uri_path = f"/mediation/client?mac={self.mac}&appli=1"
             auth_req = self._make_request(
                 "GET", uri_path,
