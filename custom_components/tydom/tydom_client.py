@@ -123,60 +123,78 @@ class TydomClient:
         return "\r\n".join(lines)
 
     @staticmethod
-    def _parse_nonce(raw: str) -> str | None:
-        """Extrait le nonce depuis un header WWW-Authenticate: Digest …"""
-        # Cherche: nonce="<valeur>"
-        m = re.search(r'[Nn]once="([^"]+)"', raw)
-        return m.group(1) if m else None
+    def _parse_www_authenticate(raw: str) -> dict[str, str]:
+        """Extrait les paramètres d'un challenge WWW-Authenticate: Digest."""
+        auth_match = re.search(r'WWW-Authenticate:\s*Digest\s*(.*)', raw, re.IGNORECASE)
+        challenge = auth_match.group(1) if auth_match else raw
+        params: dict[str, str] = {}
+        for name, _, quoted, unquoted in re.findall(
+            r'([a-zA-Z]+)=("([^"]*)"|([^,]*))(?:,\s*)?', challenge
+        ):
+            params[name.lower()] = quoted or unquoted.strip()
+        return params
 
-    def _digest_response(self, nonce: str, uri: str | None = None) -> str:
+    def _digest_response(
+        self,
+        nonce: str,
+        uri: str | None = None,
+        realm: str | None = None,
+        opaque: str | None = None,
+        algorithm: str | None = None,
+        qop: str = "auth",
+    ) -> str:
         """
-        Calcule la réponse HTTP Digest (RFC 2617 avec qop=auth).
-        
+        Calcule la réponse HTTP Digest (RFC 2617).
+
         Compatible avec tydom2mqtt qui utilise :
         - qop="auth" (obligatoire pour nc et cnonce)
         - nc=nonce_count formaté en hexadécimal 8 caractères
         - cnonce=UUID générée
-        - URI : par défaut URI complète https://{host}:443/mediation/client?mac={mac}&appli=1
-               sinon l'URI passée en paramètre
+        - URI : par défaut le chemin de requête /mediation/client?mac=...&appli=1
         """
         self._nonce_count += 1
-        nc = f"{self._nonce_count:08x}"  # Format hex 8 chars: "00000001"
-        cnonce = str(uuid.uuid4())  # UUID comme cnonce
-        qop = "auth"
-        
-        # URI pour le calcul du digest
+        nc = f"{self._nonce_count:08x}"
+        cnonce = str(uuid.uuid4())
+        realm = realm or TYDOM_REALM
+        algorithm = algorithm or "MD5"
+
         if uri is None:
-            # Valeur par défaut : chemin de requête, selon RFC 2617.
-            # La box Tydom attend /mediation/client?mac=...&appli=1, pas l'URL absolue.
             uri = f"/mediation/client?mac={self.mac}&appli=1"
-        
-        # RFC 2617 avec qop=auth :
-        # HA1 = MD5(username:realm:password)
-        # HA2 = MD5(method:uri)
-        # response = MD5(HA1:nonce:nc:cnonce:qop:HA2)
-        ha1 = hashlib.md5(f"{self.mac}:{TYDOM_REALM}:{self.password}".encode()).hexdigest()
+
+        ha1 = hashlib.md5(f"{self.mac}:{realm}:{self.password}".encode()).hexdigest()
         ha2 = hashlib.md5(f"GET:{uri}".encode()).hexdigest()
-        response = hashlib.md5(
-            f"{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}".encode()
-        ).hexdigest()
-        
+
+        if qop:
+            response = hashlib.md5(
+                f"{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}".encode()
+            ).hexdigest()
+        else:
+            response = hashlib.md5(f"{ha1}:{nonce}:{ha2}".encode()).hexdigest()
+
         _LOGGER.debug(
-            "Digest calculation (qop=auth): MAC=%s, nonce=%s, nc=%s, "
-            "cnonce=%s, uri=%s, ha1=%s, ha2=%s, response=%s",
-            self.mac, nonce, nc, cnonce, uri, ha1, ha2, response
+            "Digest calculation: MAC=%s, realm=%s, nonce=%s, nc=%s, cnonce=%s, uri=%s, qop=%s, ha1=%s, ha2=%s, response=%s",
+            self.mac, realm, nonce, nc, cnonce, uri, qop, ha1, ha2, response,
         )
-        
-        return (
-            f'Digest username="{self.mac}", '
-            f'realm="{TYDOM_REALM}", '
-            f'nonce="{nonce}", '
-            f'uri="{uri}", '
-            f'qop={qop}, '
-            f'nc={nc}, '
-            f'cnonce="{cnonce}", '
-            f'response="{response}"'
-        )
+
+        header_parts = [
+            f'Digest username="{self.mac}"',
+            f'realm="{realm}"',
+            f'nonce="{nonce}"',
+            f'uri="{uri}"',
+        ]
+        if algorithm:
+            header_parts.append(f'algorithm={algorithm}')
+        if qop:
+            header_parts.extend([
+                f'qop={qop}',
+                f'nc={nc}',
+                f'cnonce="{cnonce}"',
+            ])
+        header_parts.append(f'response="{response}"')
+        if opaque:
+            header_parts.append(f'opaque="{opaque}"')
+
+        return ", ".join(header_parts)
 
     # ──────────────────────────────────────────────────────────────────────
     # Connexion + authentification
@@ -225,7 +243,8 @@ class TydomClient:
                 _LOGGER.info("Tydom déjà authentifié (200 direct)")
                 return True
 
-            nonce = self._parse_nonce(challenge)
+            auth_params = self._parse_www_authenticate(challenge)
+            nonce = auth_params.get("nonce")
             if not nonce:
                 _LOGGER.error("Challenge sans nonce reçu :\n%s", challenge)
                 await ws.close()
@@ -235,7 +254,16 @@ class TydomClient:
             uri = f"/mediation/client?mac={self.mac}&appli=1"
             auth_req = self._make_request(
                 "GET", uri,
-                extra_headers={"Authorization": self._digest_response(nonce, uri)},
+                extra_headers={
+                    "Authorization": self._digest_response(
+                        nonce,
+                        uri,
+                        realm=auth_params.get("realm"),
+                        opaque=auth_params.get("opaque"),
+                        algorithm=auth_params.get("algorithm"),
+                        qop=auth_params.get("qop", "auth"),
+                    )
+                },
             )
             await ws.send(auth_req)
 
@@ -266,7 +294,8 @@ class TydomClient:
                 "Tentative 1 échouée. Type exception: %s, Message: %s",
                 type(first_err).__name__, first_err
             )
-            nonce_from_reject = self._extract_nonce_from_exception(first_err)
+            auth_params = self._extract_www_authenticate_from_exception(first_err)
+            nonce_from_reject = auth_params.get("nonce")
             if nonce_from_reject:
                 _LOGGER.debug(
                     "401 reçu avant upgrade WS (firmware récent). "
@@ -282,7 +311,13 @@ class TydomClient:
 
         # ── Tentative 2 : upgrade WS avec Authorization: Digest ──────────
         # (firmware Tydom 2.0 qui envoie 401 avant l'upgrade)
-        digest_value = self._digest_response(nonce_from_reject)
+        digest_value = self._digest_response(
+            nonce_from_reject,
+            realm=auth_params.get("realm"),
+            opaque=auth_params.get("opaque"),
+            algorithm=auth_params.get("algorithm"),
+            qop=auth_params.get("qop", "auth"),
+        )
         _LOGGER.debug(
             "Reconnexion avec Digest (qop=auth) dans les headers WS upgrade. "
             "Nonce=%s, Digest=%s",
@@ -322,45 +357,39 @@ class TydomClient:
         return True
 
     @staticmethod
-    def _extract_nonce_from_exception(err: Exception) -> str | None:
+    def _extract_www_authenticate_from_exception(err: Exception) -> dict[str, str]:
         """
-        Tente d'extraire le nonce depuis l'exception levée par websockets
-        quand la box répond 401 avant l'upgrade.
+        Tente d'extraire les paramètres WWW-Authenticate depuis l'exception levée
+        par websockets quand la box répond 401 avant l'upgrade.
         Compatible websockets >= 10 (InvalidStatusCode / RejectHandshake).
         """
-        # websockets >= 10 : RejectHandshake ou InvalidStatusCode
-        # Les headers de la réponse 401 sont dans err.headers ou err.response.headers
         headers_str = ""
 
-        # Attribut 'headers' direct (websockets 10-11)
         if hasattr(err, "headers"):
             try:
                 headers_str = str(err.headers)
-                _LOGGER.debug("Nonce search: headers attribute found")
+                _LOGGER.debug("Digest auth search: headers attribute found")
             except Exception as e:
-                _LOGGER.debug("Nonce search: headers attribute error: %s", e)
+                _LOGGER.debug("Digest auth search: headers attribute error: %s", e)
 
-        # Attribut 'response' (websockets 12+)
         if not headers_str and hasattr(err, "response"):
             try:
                 headers_str = str(err.response.headers)
-                _LOGGER.debug("Nonce search: response.headers attribute found")
+                _LOGGER.debug("Digest auth search: response.headers attribute found")
             except Exception as e:
-                _LOGGER.debug("Nonce search: response.headers attribute error: %s", e)
+                _LOGGER.debug("Digest auth search: response.headers attribute error: %s", e)
 
-        # Dernier recours : représentation texte de l'exception
         if not headers_str:
             headers_str = str(err)
-            _LOGGER.debug("Nonce search: using exception string representation")
+            _LOGGER.debug("Digest auth search: using exception string representation")
 
-        _LOGGER.debug("Nonce search: headers_str=%s", headers_str[:500])
-        nonce = re.search(r'[Nn]once="([^"]+)"', headers_str)
-        if nonce:
-            result = nonce.group(1)
-            _LOGGER.debug("Nonce found: %s", result)
-            return result
-        _LOGGER.warning("Nonce NOT found in: %s", headers_str)
-        return None
+        _LOGGER.debug("Digest auth search: headers_str=%s", headers_str[:500])
+        auth_params = TydomClient._parse_www_authenticate(headers_str)
+        if auth_params:
+            _LOGGER.debug("Digest auth params found: %s", auth_params)
+            return auth_params
+        _LOGGER.warning("Digest auth params NOT found in: %s", headers_str)
+        return {}
 
     async def disconnect(self) -> None:
         self._running = False
