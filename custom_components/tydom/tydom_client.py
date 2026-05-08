@@ -78,8 +78,20 @@ class TydomClient:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-        # Active la renegotiation SSL non sécurisée pour les anciennes box Tydom
-        ctx.options |= 0x4  # SSL_OP_LEGACY_SERVER_CONNECT
+        
+        # Essayer d'ajouter l'option pour la renegotiation non sécurisée
+        try:
+            # SSL_OP_LEGACY_SERVER_CONNECT = 0x4 (pour anciennes renegociations)
+            if hasattr(ssl, 'OP_LEGACY_SERVER_CONNECT'):
+                ctx.options |= ssl.OP_LEGACY_SERVER_CONNECT
+                _LOGGER.debug("SSL_OP_LEGACY_SERVER_CONNECT activé")
+            else:
+                # Fallback pour Python < 3.10 ou versions sans cette option
+                ctx.options |= 0x4
+                _LOGGER.debug("SSL_OP_LEGACY_SERVER_CONNECT (0x4) ajouté via fallback")
+        except Exception as e:
+            _LOGGER.warning("Impossible d'ajouter SSL_OP_LEGACY_SERVER_CONNECT: %s", e)
+        
         return ctx
 
     # ──────────────────────────────────────────────────────────────────────
@@ -126,6 +138,12 @@ class TydomClient:
         ha1 = hashlib.md5(f"{self.mac}:{TYDOM_REALM}:{self.password}".encode()).hexdigest()
         ha2 = hashlib.md5(f"GET:{uri}".encode()).hexdigest()
         response = hashlib.md5(f"{ha1}:{nonce}:{ha2}".encode()).hexdigest()
+        
+        _LOGGER.debug(
+            "Digest calculation: MAC=%s, nonce=%s, ha1=%s, ha2=%s, response=%s",
+            self.mac, nonce, ha1, ha2, response
+        )
+        
         return (
             f'Digest username="{self.mac}", '
             f'realm="{TYDOM_REALM}", '
@@ -218,6 +236,10 @@ class TydomClient:
 
         except Exception as first_err:
             # Récupérer le nonce depuis les headers de la réponse 401 rejetée
+            _LOGGER.debug(
+                "Tentative 1 échouée. Type exception: %s, Message: %s",
+                type(first_err).__name__, first_err
+            )
             nonce_from_reject = self._extract_nonce_from_exception(first_err)
             if nonce_from_reject:
                 _LOGGER.debug(
@@ -227,7 +249,8 @@ class TydomClient:
             else:
                 _LOGGER.error(
                     "Connexion WSS échouée (tentative sans auth) : %s\n"
-                    "host=%s, MAC=%s", first_err, self.host, self.mac
+                    "Exception type: %s\n"
+                    "host=%s, MAC=%s", first_err, type(first_err).__name__, self.host, self.mac
                 )
                 return False
 
@@ -235,7 +258,11 @@ class TydomClient:
         # (firmware Tydom 2.0 qui envoie 401 avant l'upgrade)
         uri = f"/mediation/client?mac={self.mac}&appli=1"
         digest_value = self._digest_response(nonce_from_reject)
-        _LOGGER.debug("Reconnexion avec Digest dans les headers WS upgrade")
+        _LOGGER.debug(
+            "Reconnexion avec Digest dans les headers WS upgrade. "
+            "Nonce=%s, Digest=%s",
+            nonce_from_reject, digest_value
+        )
         try:
             ws = await asyncio.wait_for(
                 websockets.connect(
@@ -251,8 +278,10 @@ class TydomClient:
         except Exception as second_err:
             _LOGGER.error(
                 "Connexion WSS avec Digest échouée : %s\n"
+                "Nonce utilisé : %s\n"
+                "Digest envoyé : %s\n"
                 "→ Vérifiez MAC (%s) et mot de passe.",
-                second_err, self.mac
+                second_err, nonce_from_reject, digest_value, self.mac
             )
             return False
 
@@ -282,22 +311,31 @@ class TydomClient:
         if hasattr(err, "headers"):
             try:
                 headers_str = str(err.headers)
-            except Exception:
-                pass
+                _LOGGER.debug("Nonce search: headers attribute found")
+            except Exception as e:
+                _LOGGER.debug("Nonce search: headers attribute error: %s", e)
 
         # Attribut 'response' (websockets 12+)
         if not headers_str and hasattr(err, "response"):
             try:
                 headers_str = str(err.response.headers)
-            except Exception:
-                pass
+                _LOGGER.debug("Nonce search: response.headers attribute found")
+            except Exception as e:
+                _LOGGER.debug("Nonce search: response.headers attribute error: %s", e)
 
         # Dernier recours : représentation texte de l'exception
         if not headers_str:
             headers_str = str(err)
+            _LOGGER.debug("Nonce search: using exception string representation")
 
+        _LOGGER.debug("Nonce search: headers_str=%s", headers_str[:500])
         nonce = re.search(r'[Nn]once="([^"]+)"', headers_str)
-        return nonce.group(1) if nonce else None
+        if nonce:
+            result = nonce.group(1)
+            _LOGGER.debug("Nonce found: %s", result)
+            return result
+        _LOGGER.warning("Nonce NOT found in: %s", headers_str)
+        return None
 
     async def disconnect(self) -> None:
         self._running = False
