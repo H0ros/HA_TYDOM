@@ -69,10 +69,17 @@ class TydomClient:
 
     @staticmethod
     def _make_ssl_context() -> ssl.SSLContext:
-        """SSL sans vérification : la box utilise un certificat auto-signé."""
+        """SSL sans vérification : la box utilise un certificat auto-signé.
+        
+        Active la renegotiation SSL non sécurisée pour compatibilité avec
+        les anciennes versions du firmware Tydom qui utilisent une ancienne
+        configuration SSL (UNSAFE_LEGACY_RENEGOTIATION_DISABLED).
+        """
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
+        # Active la renegotiation SSL non sécurisée pour les anciennes box Tydom
+        ctx.options |= 0x4  # SSL_OP_LEGACY_SERVER_CONNECT
         return ctx
 
     # ──────────────────────────────────────────────────────────────────────
