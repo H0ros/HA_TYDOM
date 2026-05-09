@@ -131,15 +131,12 @@ class TydomClient:
         ):
             params[name.lower()] = quoted or unquoted.strip()
         return params
-        """Extrait les paramètres d'un challenge WWW-Authenticate: Digest."""
-        auth_match = re.search(r'WWW-Authenticate:\s*Digest\s*(.*)', raw, re.IGNORECASE)
-        challenge = auth_match.group(1) if auth_match else raw
-        params: dict[str, str] = {}
-        for name, _, quoted, unquoted in re.findall(
-            r'([a-zA-Z]+)=("([^"]*)"|([^,]*))(?:,\s*)?', challenge
-        ):
-            params[name.lower()] = quoted or unquoted.strip()
-        return params
+
+    def _generate_websocket_key(self) -> str:
+        """Génère une clé Sec-WebSocket-Key aléatoire."""
+        import base64
+        import os
+        return base64.b64encode(os.urandom(16)).decode('utf-8')
 
     def _digest_response(
         self,
@@ -449,6 +446,7 @@ class TydomClient:
         return True
 
     @staticmethod
+    @staticmethod
     def _extract_www_authenticate_from_exception(err: Exception) -> dict[str, str]:
         """
         Tente d'extraire les paramètres WWW-Authenticate depuis l'exception levée
@@ -476,7 +474,7 @@ class TydomClient:
             _LOGGER.debug("Digest auth search: using exception string representation")
 
         _LOGGER.debug("Digest auth search: headers_str=%s", headers_str[:500])
-        auth_params = self._parse_www_authenticate(headers_str)
+        auth_params = TydomClient._parse_www_authenticate(headers_str)
         if auth_params:
             _LOGGER.debug("Digest auth params found: %s", auth_params)
             return auth_params
