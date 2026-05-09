@@ -6,10 +6,11 @@
   "documentation": "https://github.com/H0ros/HA_TYDOM",
   "issue_tracker": "https://github.com/H0ros/HA_TYDOM/issues",
   "requirements": [
-    "websockets>=11.0",
-    "requests>=2.28.0"
+    "websockets>=11.0"
   ],
   "dependencies": [],
-  "codeowners": ["@H0ros"],
+  "codeowners": [
+    "@H0ros"
+  ],
   "iot_class": "local_push"
 }

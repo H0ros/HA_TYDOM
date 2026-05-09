@@ -3,7 +3,7 @@
 Protocole local (Tydom 1.0) :
 1. Handshake HTTPS vers la box dans un thread executor (opération bloquante)
    → récupère le challenge WWW-Authenticate: Digest
-2. Calcul de la réponse Digest via requests.auth.HTTPDigestAuth
+2. Calcul de la réponse Digest RFC 2617 (MD5) — implémentation directe
 3. Ouverture du WebSocket asyncio avec l'en-tête Authorization calculé
 4. Envoi de requêtes HTTP/1.1 encapsulées dans le WebSocket
 5. Réception et parsing des réponses HTTP/1.1 chunked encapsulées
@@ -25,7 +25,6 @@ import ssl
 from typing import Any, Callable
 
 import websockets
-from requests.auth import HTTPDigestAuth
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -255,7 +254,14 @@ class TydomClient:
         return ctx
 
     def _build_digest_header(self, www_auth: str) -> str:
-        """Calcule l'Authorization Digest depuis le challenge WWW-Authenticate."""
+        """Calcule l'Authorization Digest (RFC 2617) depuis le challenge WWW-Authenticate.
+
+        Implémentation directe sans requests.HTTPDigestAuth pour garantir
+        nc=00000001 et éviter tout problème d'état interne de la librairie.
+        Identique à la logique utilisée par tydom2mqtt.
+        """
+        import hashlib
+
         parts = [p.strip() for p in www_auth.replace("Digest ", "").split(",")]
         chal: dict[str, str] = {}
         for part in parts:
@@ -265,14 +271,23 @@ class TydomClient:
 
         nonce = chal.get("nonce", "")
         realm = chal.get("realm", "protected area")
+        uri   = MEDIATION_URI.format(mac=self._mac)
 
-        digest_auth = HTTPDigestAuth(self._mac, self._password)
-        digest_auth._thread_local.chal = {"nonce": nonce, "realm": realm, "qop": "auth"}
-        digest_auth._thread_local.last_nonce = nonce
-        digest_auth._thread_local.nonce_count = 1
+        # Calcul RFC 2617 — qop=auth
+        ha1      = hashlib.md5(f"{self._mac}:{realm}:{self._password}".encode()).hexdigest()
+        ha2      = hashlib.md5(f"GET:{uri}".encode()).hexdigest()
+        nc       = "00000001"
+        cnonce   = hashlib.md5(b"tydom_ha").hexdigest()[:8]
+        response = hashlib.md5(
+            f"{ha1}:{nonce}:{nc}:{cnonce}:auth:{ha2}".encode()
+        ).hexdigest()
 
-        uri = f"https://{self._host}:{TYDOM_PORT}{MEDIATION_URI.format(mac=self._mac)}"
-        return digest_auth.build_digest_header("GET", uri)
+        return (
+            f'Digest username="{self._mac}", realm="{realm}", '
+            f'nonce="{nonce}", uri="{uri}", '
+            f'response="{response}", '
+            f'qop=auth, nc={nc}, cnonce="{cnonce}"'
+        )
 
     async def connect(self) -> bool:
         """Handshake + ouverture WebSocket, entièrement non-bloquant pour HA."""
