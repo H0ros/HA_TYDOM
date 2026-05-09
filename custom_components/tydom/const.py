@@ -2,17 +2,12 @@
 
 DOMAIN = "tydom"
 
-# Clés de configuration
 CONF_MAC = "mac"
 CONF_PASSWORD = "password"
 CONF_HOST = "host"
-CONF_DD_EMAIL = "deltadore_email"
-CONF_DD_PASSWORD = "deltadore_password"
 
-# Intervalle de polling (secondes)
 DEFAULT_SCAN_INTERVAL = 60
 
-# Correspondance last_usage Tydom → plateforme HA
 USAGE_TO_PLATFORM: dict[str, str] = {
     "shutter": "cover",
     "garage_door": "cover",
