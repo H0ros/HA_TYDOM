@@ -1,14 +1,16 @@
 """Client WebSocket pour la box Tydom de Delta Dore.
 
-Protocole local (Tydom 1.0) :
-1. Handshake HTTPS dans un thread executor → récupère WWW-Authenticate: Digest
-2. Calcul de la réponse Digest RFC 2617 (MD5) — implémentation directe
-3. Ouverture du WebSocket asyncio avec l'en-tête Authorization
+Protocole (une seule connexion TCP) :
+1. Ouverture connexion TLS vers la box (http.client.HTTPSConnection)
+2. GET /mediation/... → 401 + WWW-Authenticate: Digest  (challenge)
+3. Calcul de la réponse Digest RFC 2617 (hashlib MD5)
+4. GET /mediation/... avec Authorization: Digest → 101 Switching Protocols
+5. Récupération du socket TLS sous-jacent (conn.sock)
+6. Passage de ce socket à websockets.connect(sock=...) pour la suite
 
-Note sur le mot de passe Tydom 1 :
-- Par défaut en sortie d'usine : les 6 derniers caractères de l'adresse MAC
-  Exemple : MAC 00:1A:25:08:84:6E → mot de passe : 08846E
-- Ce mot de passe peut avoir été changé via l'ancienne version de l'app Delta Dore (v3)
+L'étape clé est que les étapes 2 à 6 se font sur la MÊME connexion TCP.
+La box Tydom lie le nonce Digest à la session TCP — un nonce obtenu sur
+une connexion fermée est rejeté avec HTTP 401 sur la nouvelle connexion WebSocket.
 """
 from __future__ import annotations
 
@@ -32,7 +34,7 @@ TYDOM_REMOTE_HOST = "mediation.tydom.com"
 
 
 # ---------------------------------------------------------------------------
-# Helpers de parsing
+# Helpers de parsing des réponses HTTP/1.1 encapsulées dans le WebSocket
 # ---------------------------------------------------------------------------
 
 def _parse_chunked_body(raw: str) -> str:
@@ -84,15 +86,52 @@ def _get_uri_origin(raw_bytes: bytes, cmd_prefix: str = "") -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Handshake HTTP synchrone → executor
+# Calcul Digest RFC 2617
 # ---------------------------------------------------------------------------
 
-def _do_http_handshake_sync(host: str, port: int, mac: str, ssl_context: ssl.SSLContext) -> str | None:
-    """Handshake HTTPS pour obtenir le challenge WWW-Authenticate.
+def _build_digest_header(mac: str, password: str, www_auth: str, uri: str) -> str:
+    """Calcul Digest Auth RFC 2617, qop=auth, nc=00000001."""
+    parts = [p.strip() for p in www_auth.replace("Digest ", "").split(",")]
+    chal: dict[str, str] = {}
+    for part in parts:
+        if "=" in part:
+            k, v = part.split("=", 1)
+            chal[k.strip()] = v.strip().strip('"')
+
+    nonce = chal.get("nonce", "")
+    realm = chal.get("realm", "protected area")
+
+    ha1      = hashlib.md5(f"{mac}:{realm}:{password}".encode()).hexdigest()
+    ha2      = hashlib.md5(f"GET:{uri}".encode()).hexdigest()
+    nc       = "00000001"
+    cnonce   = hashlib.md5(b"tydom_ha").hexdigest()[:8]
+    response = hashlib.md5(f"{ha1}:{nonce}:{nc}:{cnonce}:auth:{ha2}".encode()).hexdigest()
+
+    return (
+        f'Digest username="{mac}", realm="{realm}", '
+        f'nonce="{nonce}", uri="{uri}", '
+        f'response="{response}", '
+        f'qop=auth, nc={nc}, cnonce="{cnonce}"'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Handshake complet sur une seule connexion TCP (synchrone → executor)
+# ---------------------------------------------------------------------------
+
+def _do_full_handshake_sync(
+    host: str, port: int, mac: str, password: str, ssl_context: ssl.SSLContext
+):
+    """Effectue les deux échanges HTTP sur la même connexion TCP.
+
+    Retourne le socket TLS (conn.sock) prêt pour l'upgrade WebSocket,
+    ou lève une exception en cas d'échec.
+
     Synchrone — doit être appelé via loop.run_in_executor().
     """
-    uri_path = MEDIATION_URI.format(mac=mac)
-    headers = {
+    uri = MEDIATION_URI.format(mac=mac)
+
+    ws_headers = {
         "Connection": "Upgrade",
         "Upgrade": "websocket",
         "Host": f"{host}:{port}",
@@ -100,14 +139,65 @@ def _do_http_handshake_sync(host: str, port: int, mac: str, ssl_context: ssl.SSL
         "Sec-WebSocket-Key": base64.b64encode(os.urandom(16)).decode("ascii"),
         "Sec-WebSocket-Version": "13",
     }
+
     conn = http.client.HTTPSConnection(host, port, context=ssl_context, timeout=10)
-    conn.request("GET", uri_path, None, headers)
-    res = conn.getresponse()
-    www_auth = res.headers.get("WWW-Authenticate", "")
-    status = res.status
-    res.read()
-    conn.close()
-    return www_auth or None, status
+
+    # --- Requête 1 : GET sans Authorization → la box répond 401 + challenge ---
+    conn.request("GET", uri, None, ws_headers)
+    res1 = conn.getresponse()
+    www_auth = res1.headers.get("WWW-Authenticate", "")
+    status1 = res1.status
+    res1.read()
+
+    _LOGGER.debug("Handshake req1 — status=%d, WWW-Authenticate=%s", status1, www_auth)
+
+    if status1 != 401 or not www_auth:
+        conn.close()
+        raise ConnectionError(
+            f"Réponse inattendue lors du handshake (status={status1}, "
+            f"www_auth={www_auth!r}). Attendu: 401 + WWW-Authenticate."
+        )
+
+    # --- Calcul de l'Authorization Digest ---
+    authorization = _build_digest_header(mac, password, www_auth, uri)
+    _LOGGER.debug("Authorization Digest calculée: %s", authorization)
+
+    # --- Requête 2 : GET avec Authorization → la box doit répondre 101 ---
+    # IMPORTANT : on réutilise la même connexion TCP (même objet conn)
+    ws_headers_with_auth = dict(ws_headers)
+    ws_headers_with_auth["Authorization"] = authorization
+    # Nouveau Sec-WebSocket-Key pour cette vraie requête WebSocket
+    ws_headers_with_auth["Sec-WebSocket-Key"] = base64.b64encode(os.urandom(16)).decode("ascii")
+
+    conn.request("GET", uri, None, ws_headers_with_auth)
+    res2 = conn.getresponse()
+    status2 = res2.status
+    _LOGGER.debug("Handshake req2 — status=%d", status2)
+
+    if status2 == 401:
+        res2.read()
+        conn.close()
+        raise PermissionError(
+            f"HTTP 401 après envoi de l'Authorization Digest. "
+            f"Vérifiez le mot de passe (par défaut Tydom 1 = 6 derniers "
+            f"caractères de la MAC en majuscules)."
+        )
+
+    if status2 != 101:
+        body = res2.read()
+        conn.close()
+        raise ConnectionError(
+            f"Upgrade WebSocket refusé (status={status2}). "
+            f"Réponse: {body[:200]!r}"
+        )
+
+    # La connexion est maintenant en mode WebSocket
+    # On récupère le socket TLS sous-jacent SANS fermer conn
+    raw_sock = conn.sock
+    # Détacher le socket de http.client pour éviter qu'il le ferme
+    conn.sock = None
+
+    return raw_sock
 
 
 # ---------------------------------------------------------------------------
@@ -142,98 +232,58 @@ class TydomClient:
 
     def _build_ssl_context(self) -> ssl.SSLContext:
         ctx = ssl._create_unverified_context()
-        # OP_LEGACY_SERVER_CONNECT requis pour les anciens firmwares TLS de la Tydom 1
         legacy_opt = getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0x4)
         ctx.options |= legacy_opt
         return ctx
 
-    def _build_digest_header(self, www_auth: str) -> str:
-        """Calcul Digest RFC 2617 — implémentation directe (qop=auth, nc=00000001)."""
-        parts = [p.strip() for p in www_auth.replace("Digest ", "").split(",")]
-        chal: dict[str, str] = {}
-        for part in parts:
-            if "=" in part:
-                k, v = part.split("=", 1)
-                chal[k.strip()] = v.strip().strip('"')
-
-        nonce = chal.get("nonce", "")
-        realm = chal.get("realm", "protected area")
-        uri   = MEDIATION_URI.format(mac=self._mac)
-
-        ha1      = hashlib.md5(f"{self._mac}:{realm}:{self._password}".encode()).hexdigest()
-        ha2      = hashlib.md5(f"GET:{uri}".encode()).hexdigest()
-        nc       = "00000001"
-        cnonce   = hashlib.md5(b"tydom_ha").hexdigest()[:8]
-        response = hashlib.md5(f"{ha1}:{nonce}:{nc}:{cnonce}:auth:{ha2}".encode()).hexdigest()
-
-        header = (
-            f'Digest username="{self._mac}", realm="{realm}", '
-            f'nonce="{nonce}", uri="{uri}", '
-            f'response="{response}", '
-            f'qop=auth, nc={nc}, cnonce="{cnonce}"'
-        )
-        _LOGGER.debug("Digest calculé — realm=%s, nonce=%s, response=%s", realm, nonce, response)
-        return header
-
     async def connect(self) -> bool:
-        """Handshake + ouverture WebSocket, non-bloquant pour HA."""
+        """Handshake complet + ouverture WebSocket sur la même connexion TCP."""
         _LOGGER.info("Connexion à la box Tydom (%s)…", self._host)
 
         ssl_context = self._build_ssl_context()
         loop = asyncio.get_event_loop()
 
-        # Étape 1 — handshake HTTPS (executor)
+        # Handshake complet dans un executor (opérations réseau bloquantes)
         try:
-            result = await loop.run_in_executor(
-                None, _do_http_handshake_sync, self._host, TYDOM_PORT, self._mac, ssl_context
+            raw_sock = await loop.run_in_executor(
+                None,
+                _do_full_handshake_sync,
+                self._host,
+                TYDOM_PORT,
+                self._mac,
+                self._password,
+                ssl_context,
             )
-            www_auth, http_status = result
+        except PermissionError as exc:
+            _LOGGER.error("%s", exc)
+            return False
         except Exception as exc:
             _LOGGER.error("Impossible de contacter la box Tydom : %s", exc)
             return False
 
-        _LOGGER.debug("Handshake HTTP — status=%s, WWW-Authenticate=%s", http_status, www_auth)
-
-        if not www_auth:
-            _LOGGER.error(
-                "Pas de challenge Digest (WWW-Authenticate vide, HTTP status=%s). "
-                "Vérifiez l'adresse IP et l'adresse MAC.", http_status
-            )
-            return False
-
-        # Étape 2 — calcul Digest
-        try:
-            authorization = self._build_digest_header(www_auth)
-        except Exception as exc:
-            _LOGGER.error("Erreur calcul Digest : %s", exc)
-            return False
-
-        _LOGGER.debug("Authorization: %s", authorization)
-
-        # Étape 3 — WebSocket
-        uri_path = MEDIATION_URI.format(mac=self._mac)
-        ws_uri = f"wss://{self._host}:{TYDOM_PORT}{uri_path}"
-        _LOGGER.debug("Ouverture WebSocket vers %s", ws_uri)
-
-        import inspect
-        ws_kwargs: dict = {"ssl": ssl_context, "ping_interval": 30, "ping_timeout": 10, "close_timeout": 5}
-        if "additional_headers" in inspect.signature(websockets.connect).parameters:
-            ws_kwargs["additional_headers"] = {"Authorization": authorization}
-        else:
-            ws_kwargs["extra_headers"] = {"Authorization": authorization}
+        # Le socket est maintenant en mode WebSocket (après 101 Switching Protocols)
+        # On le passe à websockets pour gérer la couche WS
+        ws_uri = f"wss://{self._host}:{TYDOM_PORT}{MEDIATION_URI.format(mac=self._mac)}"
 
         try:
-            self._websocket = await websockets.connect(ws_uri, **ws_kwargs)
-        except Exception as exc:
-            _LOGGER.error(
-                "Impossible d'ouvrir le WebSocket Tydom : %s — "
-                "Si HTTP 401 : vérifiez le mot de passe (par défaut = 6 derniers "
-                "caractères de la MAC, ex : MAC 00:1A:25:08:84:6E → 08846E)", exc
+            self._websocket = await websockets.connect(
+                ws_uri,
+                sock=raw_sock,
+                ssl=None,          # TLS déjà établi sur raw_sock
+                ping_interval=30,
+                ping_timeout=10,
+                close_timeout=5,
             )
+        except Exception as exc:
+            _LOGGER.error("Impossible d'initialiser le WebSocket sur le socket existant : %s", exc)
+            try:
+                raw_sock.close()
+            except Exception:
+                pass
             return False
 
         self._connected = True
-        _LOGGER.info("WebSocket Tydom connecté (%s)", self._host)
+        _LOGGER.info("WebSocket Tydom connecté avec succès (%s)", self._host)
         return True
 
     async def disconnect(self) -> None:
@@ -291,8 +341,13 @@ class TydomClient:
     async def get_devices_meta(self) -> list | None: return await self.get("/devices/meta")
     async def get_configs_file(self) -> dict | None: return await self.get("/configs/file")
 
-    async def put_device_data(self, device_id: int, endpoint_id: int, name: str, value: Any) -> None:
-        await self.put(f"/devices/{device_id}/endpoints/{endpoint_id}/data", [{"name": name, "value": value}])
+    async def put_device_data(
+        self, device_id: int, endpoint_id: int, name: str, value: Any
+    ) -> None:
+        await self.put(
+            f"/devices/{device_id}/endpoints/{endpoint_id}/data",
+            [{"name": name, "value": value}]
+        )
 
     async def listen(self) -> None:
         if not self._websocket or not self._connected:
