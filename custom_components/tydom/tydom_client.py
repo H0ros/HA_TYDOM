@@ -235,8 +235,24 @@ class TydomClient:
     # ------------------------------------------------------------------
 
     def _build_ssl_context(self) -> ssl.SSLContext:
-        """Contexte SSL sans vérification (certificat auto-signé Tydom)."""
-        return ssl._create_unverified_context()
+        """Contexte SSL adapté à la Tydom 1.0.
+
+        La box utilise un vieux firmware TLS qui requiert deux adaptations :
+        - Désactivation de la vérification du certificat (auto-signé)
+        - Autorisation du "legacy renegotiation" (SSL_OP_LEGACY_SERVER_CONNECT)
+          nécessaire pour OpenSSL >= 3.0 qui le désactive par défaut
+        """
+        ctx = ssl._create_unverified_context()
+        # OP_LEGACY_SERVER_CONNECT = 0x4 — autorise la renégociation non-sécurisée
+        # Nécessaire pour les box Tydom avec ancien firmware TLS
+        try:
+            ctx.options |= 0x4  # ssl.OP_LEGACY_SERVER_CONNECT (Python 3.12+)
+        except AttributeError:
+            pass
+        # Fallback explicite si la constante est disponible
+        if hasattr(ssl, "OP_LEGACY_SERVER_CONNECT"):
+            ctx.options |= ssl.OP_LEGACY_SERVER_CONNECT
+        return ctx
 
     def _build_digest_header(self, www_auth: str) -> str:
         """Calcule l'Authorization Digest depuis le challenge WWW-Authenticate."""
