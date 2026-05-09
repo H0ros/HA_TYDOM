@@ -2,27 +2,33 @@
   "config": {
     "step": {
       "user": {
-        "title": "Configure Tydom Box",
-        "description": "Enter the connection details for your Delta Dore Tydom box.",
+        "title": "Connect to Tydom hub",
+        "description": "Enter the MAC address and **one** of the two authentication options:\n- **PIN code**: the code printed on the sticker on the bottom of the hub\n- **Delta Dore account**: email + password from the Delta Dore mobile app",
         "data": {
-          "mac_address": "Tydom MAC Address",
-          "password": "PIN Code / Password",
-          "host": "IP Address (optional, leave empty for auto-discovery)"
+          "mac": "Hub MAC address",
+          "host": "IP address (optional)",
+          "password": "PIN code from sticker",
+          "deltadore_email": "Delta Dore account email (optional)",
+          "deltadore_password": "Delta Dore account password (optional)"
         },
         "data_description": {
-          "mac_address": "Format: AA:BB:CC:DD:EE:FF (found on the underside of your box)",
-          "password": "PIN code printed on your box label",
-          "host": "Useful if mDNS discovery does not work on your network"
+          "mac": "Format: AA:BB:CC:DD:EE:FF — found on the sticker on the bottom of the hub",
+          "host": "Leave empty for automatic mDNS discovery. Fill in if auto-discovery fails.",
+          "password": "6-digit code on the sticker. Leave empty if using Delta Dore account credentials.",
+          "deltadore_email": "Delta Dore app login. Used if PIN is missing or no longer works.",
+          "deltadore_password": "Delta Dore app password."
         }
       }
     },
     "error": {
-      "cannot_connect": "Unable to connect to the Tydom box. Check MAC address, password and ensure the box is reachable on your network.",
-      "invalid_mac": "Invalid MAC address format. Use AA:BB:CC:DD:EE:FF.",
-      "unknown": "Unexpected error."
+      "cannot_connect": "Cannot connect to the hub. Check your MAC address, PIN code and IP address.",
+      "invalid_mac": "Invalid MAC address. Expected format: AA:BB:CC:DD:EE:FF",
+      "missing_credentials": "Please provide either the PIN code or Delta Dore account credentials.",
+      "cloud_password_not_found": "Delta Dore login succeeded but Tydom password was not found in the account.",
+      "cannot_connect_cloud": "Cannot reach Delta Dore API. Check your credentials and internet connection."
     },
     "abort": {
-      "already_configured": "This Tydom box is already configured."
+      "already_configured": "This Tydom hub is already configured."
     }
   }
 }
