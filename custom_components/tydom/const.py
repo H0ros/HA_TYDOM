@@ -2,44 +2,35 @@
 
 DOMAIN = "tydom"
 
-# Signaux dispatcher
-SIGNAL_TYDOM_UPDATE = "tydom_update"
-SIGNAL_TYDOM_CONNECTED = "tydom_connected"
-
-# Configuration
-CONF_MAC = "mac_address"
+# Clés de configuration
+CONF_MAC = "mac"
 CONF_PASSWORD = "password"
 CONF_HOST = "host"
 
-# Types d'équipements
-DEVICE_TYPE_SHUTTER = "cover"
-DEVICE_TYPE_LIGHT = "light"
-DEVICE_TYPE_SWITCH = "switch"
-DEVICE_TYPE_THERMOSTAT = "climate"
-DEVICE_TYPE_SMOKE = "binary_sensor"
-DEVICE_TYPE_GATE = "cover"
-DEVICE_TYPE_GARAGE = "cover"
-DEVICE_TYPE_ALARM = "alarm_control_panel"
+# Intervalle de polling (secondes) — complément des messages push
+DEFAULT_SCAN_INTERVAL = 60
 
-# Mapping types Tydom -> types HA
-DEVICE_CATEGORY_MAP = {
-    "SHUTTER": "cover",
-    "BLIND": "cover",
-    "CURTAIN": "cover",
-    "GATE": "cover",
-    "GARAGE": "cover",
-    "WINDOWOPENER": "cover",
-    "LIGHT": "light",
-    "DIMMER": "light",
-    "OUTLET": "switch",
-    "SWITCH": "switch",
-    "HVAC": "climate",
-    "THERMOSTAT": "climate",
-    "BOILER": "climate",
-    "SMOKE": "binary_sensor",
-    "ALARM": "alarm_control_panel",
-    "SENSOR": "sensor",
+# Correspondance last_usage Tydom → type d'entité HA
+USAGE_TO_PLATFORM: dict[str, str] = {
+    "shutter": "cover",
+    "garage_door": "cover",
+    "window": "cover",
+    "gate": "cover",
+    "light": "light",
+    "dimmer": "light",
+    "switch": "switch",
+    "boiler": "climate",
+    "electric_heater": "climate",
+    "hvac": "climate",
+    "thermostat": "climate",
+    "smoke_detector": "binary_sensor",
+    "motion_detector": "binary_sensor",
+    "opening_detector": "binary_sensor",
+    "temperature_sensor": "sensor",
+    "humidity_sensor": "sensor",
+    "co2_sensor": "sensor",
+    "battery": "sensor",
 }
 
-# Plateformes supportées
+# Plateformes déclarées
 PLATFORMS = ["cover", "light", "switch", "climate", "binary_sensor", "sensor"]

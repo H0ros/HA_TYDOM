@@ -1,4 +1,4 @@
-"""Plateforme Light pour Tydom."""
+"""Plateforme light (lumières, variateurs) pour Tydom."""
 from __future__ import annotations
 
 import logging
@@ -12,14 +12,15 @@ from homeassistant.components.light import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN, SIGNAL_TYDOM_UPDATE, DEVICE_TYPE_LIGHT
-from .coordinator import TydomCoordinator
+from .const import DOMAIN
+from .coordinator import TydomCoordinator, TydomDevice
 
 _LOGGER = logging.getLogger(__name__)
+
+_LIGHT_USAGES = {"light", "dimmer"}
 
 
 async def async_setup_entry(
@@ -27,113 +28,97 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Configure les entités Light."""
     coordinator: TydomCoordinator = hass.data[DOMAIN][entry.entry_id]
-    entities_added: set[str] = set()
-
-    @callback
-    def _check_new_lights() -> None:
-        new_entities = []
-        for key in coordinator.get_all_devices_by_type(DEVICE_TYPE_LIGHT):
-            if key not in entities_added:
-                entities_added.add(key)
-                config = coordinator.device_configs.get(key, {})
-                new_entities.append(
-                    TydomLight(
-                        coordinator=coordinator,
-                        key=key,
-                        device_id=config.get("device_id", key.split("_")[0]),
-                        endpoint_id=config.get("endpoint_id", key.split("_")[1] if "_" in key else "0"),
-                        name=config.get("name", f"Lumière {key}"),
-                        device_type=config.get("type", "LIGHT"),
-                    )
-                )
-        if new_entities:
-            async_add_entities(new_entities)
-
-    entry.async_on_unload(
-        async_dispatcher_connect(hass, f"{SIGNAL_TYDOM_UPDATE}_config", lambda _: _check_new_lights())
-    )
-    _check_new_lights()
+    entities = [
+        TydomLight(coordinator, device)
+        for device in coordinator.devices.values()
+        if device.last_usage in _LIGHT_USAGES
+    ]
+    _LOGGER.debug("Ajout de %d entités light Tydom", len(entities))
+    async_add_entities(entities)
 
 
-class TydomLight(LightEntity):
-    """Représente une lumière Tydom."""
+class TydomLight(CoordinatorEntity[TydomCoordinator], LightEntity):
+    """Lumière Tydom."""
 
     _attr_has_entity_name = True
-    _attr_should_poll = False
 
-    def __init__(self, coordinator, key, device_id, endpoint_id, name, device_type="LIGHT"):
-        self._coordinator = coordinator
-        self._key = key
-        self._device_id = device_id
-        self._endpoint_id = endpoint_id
-        self._attr_unique_id = f"tydom_light_{key}"
-        self._attr_name = name
-        self._is_on: bool = False
-        self._brightness: int | None = None
-        self._is_dimmable = "DIMMER" in device_type.upper()
+    def __init__(self, coordinator: TydomCoordinator, device: TydomDevice) -> None:
+        super().__init__(coordinator)
+        self._device_uid = device.unique_id
+        self._attr_unique_id = f"tydom_{device.unique_id}"
+        self._attr_name = device.name
 
-        if self._is_dimmable:
+        is_dimmer = device.last_usage == "dimmer" or "level" in device.attributes
+        if is_dimmer:
             self._attr_color_mode = ColorMode.BRIGHTNESS
             self._attr_supported_color_modes = {ColorMode.BRIGHTNESS}
         else:
             self._attr_color_mode = ColorMode.ONOFF
             self._attr_supported_color_modes = {ColorMode.ONOFF}
 
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, key)},
-            name=name,
-            manufacturer="Delta Dore",
-            model="Tydom",
-        )
-
-    async def async_added_to_hass(self) -> None:
-        self.async_on_remove(
-            async_dispatcher_connect(
-                self.hass,
-                f"{SIGNAL_TYDOM_UPDATE}_{self._key}",
-                self._handle_update,
-            )
-        )
-        self._update_from_coordinator()
-
-    @callback
-    def _handle_update(self, data: dict) -> None:
-        self._update_from_coordinator()
-        self.async_write_ha_state()
-
-    def _update_from_coordinator(self) -> None:
-        values = self._coordinator.devices.get(self._key, {}).get("values", {})
-        on_fav = values.get("onFav")
-        if on_fav is not None:
-            self._is_on = bool(on_fav)
-        level = values.get("level")
-        if level is not None:
-            # Tydom level 0-100 → HA brightness 0-255
-            self._brightness = int(int(level) * 255 / 100)
+    @property
+    def _device(self) -> TydomDevice | None:
+        return self.coordinator.get_device(self._device_uid)
 
     @property
-    def is_on(self) -> bool:
-        return self._is_on
+    def is_on(self) -> bool | None:
+        d = self._device
+        if d is None:
+            return None
+        # Tydom peut utiliser "level" (0-100) ou "on" (bool)
+        level = d.attributes.get("level")
+        if level is not None:
+            return int(level) > 0
+        on_val = d.attributes.get("on")
+        if on_val is not None:
+            return bool(on_val)
+        return None
 
     @property
     def brightness(self) -> int | None:
-        return self._brightness
+        d = self._device
+        if d is None:
+            return None
+        level = d.attributes.get("level")
+        if level is not None:
+            # Tydom : 0-100 → HA : 0-255
+            return int(int(level) * 255 / 100)
+        return None
 
     async def async_turn_on(self, **kwargs: Any) -> None:
-        self._is_on = True
-        if ATTR_BRIGHTNESS in kwargs and self._is_dimmable:
-            ha_brightness = kwargs[ATTR_BRIGHTNESS]
-            level = int(ha_brightness * 100 / 255)
-            self._brightness = ha_brightness
-            self.async_write_ha_state()
-            await self._coordinator.set_light_level(self._device_id, self._endpoint_id, level)
+        d = self._device
+        if d is None:
+            return
+        brightness = kwargs.get(ATTR_BRIGHTNESS)
+        if brightness is not None:
+            level = int(brightness * 100 / 255)
+            await self.coordinator.client.put_device_data(
+                d.device_id, d.endpoint_id, "level", level
+            )
         else:
-            self.async_write_ha_state()
-            await self._coordinator.set_light_state(self._device_id, self._endpoint_id, True)
+            if "level" in (d.attributes or {}):
+                await self.coordinator.client.put_device_data(
+                    d.device_id, d.endpoint_id, "level", 100
+                )
+            else:
+                await self.coordinator.client.put_device_data(
+                    d.device_id, d.endpoint_id, "on", True
+                )
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        self._is_on = False
+        d = self._device
+        if d is None:
+            return
+        if "level" in (d.attributes or {}):
+            await self.coordinator.client.put_device_data(
+                d.device_id, d.endpoint_id, "level", 0
+            )
+        else:
+            await self.coordinator.client.put_device_data(
+                d.device_id, d.endpoint_id, "on", False
+            )
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
         self.async_write_ha_state()
-        await self._coordinator.set_light_state(self._device_id, self._endpoint_id, False)

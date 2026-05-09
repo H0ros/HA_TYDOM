@@ -1,4 +1,4 @@
-"""Config Flow pour l'intégration Tydom."""
+"""Config flow pour l'intégration Tydom."""
 from __future__ import annotations
 
 import logging
@@ -8,53 +8,34 @@ from typing import Any
 import voluptuous as vol
 
 from homeassistant import config_entries
-from homeassistant.core import HomeAssistant
+from homeassistant.const import CONF_HOST, CONF_PASSWORD
 from homeassistant.data_entry_flow import FlowResult
 
-from .const import DOMAIN, CONF_MAC, CONF_PASSWORD, CONF_HOST
+from .const import CONF_MAC, DOMAIN
 from .tydom_client import TydomClient
 
 _LOGGER = logging.getLogger(__name__)
 
-MAC_REGEX = re.compile(r"^([0-9A-Fa-f]{2}[:\-]?){5}([0-9A-Fa-f]{2})$")
+_MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}[:\-]?){5}[0-9A-Fa-f]{2}$")
 
 
 def _normalize_mac(mac: str) -> str:
-    """Normalise l'adresse MAC (supprime séparateurs, met en majuscules)."""
+    """Normalise l'adresse MAC en retirant les séparateurs et en mettant en majuscules."""
     return mac.upper().replace(":", "").replace("-", "")
 
 
-async def _test_connection(hass: HomeAssistant, mac: str, password: str, host: str | None) -> str | None:
-    """Teste la connexion à la box Tydom. Retourne None si OK, sinon un code d'erreur."""
-    client = TydomClient(mac_address=mac, password=password, host=host or None)
-    try:
-        success = await client.connect()
-        if not success:
-            _LOGGER.error(
-                "Connexion Tydom refusée (MAC=%s, host=%s). "
-                "Activez les logs debug sur custom_components.tydom pour plus de détails.",
-                mac, client.host,
-            )
-            return "cannot_connect"
-        await client.disconnect()
-        return None
-    except Exception as err:
-        _LOGGER.error(
-            "Exception lors du test de connexion Tydom (MAC=%s, host=%s): %s",
-            mac, host, err, exc_info=True,
-        )
-        return "cannot_connect"
+def _validate_mac(mac: str) -> bool:
+    return bool(_MAC_RE.match(mac.strip()))
 
 
 class TydomConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
-    """Gère le flux de configuration de l'intégration Tydom."""
+    """Flux de configuration pour Tydom."""
 
     VERSION = 1
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Étape initiale : saisie des identifiants."""
         errors: dict[str, str] = {}
 
         if user_input is not None:
@@ -62,42 +43,47 @@ class TydomConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             password = user_input[CONF_PASSWORD].strip()
             host = user_input.get(CONF_HOST, "").strip() or None
 
-            # Validation du format MAC
-            if not MAC_REGEX.match(mac_raw):
+            if not _validate_mac(mac_raw):
                 errors[CONF_MAC] = "invalid_mac"
+            elif not password:
+                errors[CONF_PASSWORD] = "invalid_password"
             else:
                 mac = _normalize_mac(mac_raw)
 
-                # Vérifier qu'on n'a pas déjà cette box configurée
-                await self.async_set_unique_id(mac)
-                self._abort_if_unique_id_configured()
+                # Vérification de connexion
+                client = TydomClient(mac=mac, password=password, host=host)
+                try:
+                    connected = await client.connect()
+                    await client.disconnect()
+                except Exception:
+                    connected = False
 
-                # Tester la connexion
-                error = await _test_connection(self.hass, mac, password, host)
-                if error:
-                    errors["base"] = error
+                if not connected:
+                    errors["base"] = "cannot_connect"
                 else:
+                    # Évite les doublons
+                    await self.async_set_unique_id(mac)
+                    self._abort_if_unique_id_configured()
+
                     return self.async_create_entry(
-                        title=f"Tydom {mac}",
+                        title=f"Tydom {mac_raw}",
                         data={
                             CONF_MAC: mac,
                             CONF_PASSWORD: password,
-                            CONF_HOST: host,
+                            CONF_HOST: host or "",
                         },
                     )
 
+        schema = vol.Schema(
+            {
+                vol.Required(CONF_MAC): str,
+                vol.Required(CONF_PASSWORD): str,
+                vol.Optional(CONF_HOST, default=""): str,
+            }
+        )
+
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(CONF_MAC): str,
-                    vol.Required(CONF_PASSWORD): str,
-                    vol.Optional(CONF_HOST, default=""): str,
-                }
-            ),
+            data_schema=schema,
             errors=errors,
-            description_placeholders={
-                "mac_example": "AA:BB:CC:DD:EE:FF",
-                "host_example": "192.168.1.xxx (optionnel)",
-            },
         )

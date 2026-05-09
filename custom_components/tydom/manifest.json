@@ -1,13 +1,15 @@
 {
   "domain": "tydom",
   "name": "Tydom Delta Dore",
-  "version": "1.0.0",
+  "version": "2.0.0",
+  "config_flow": true,
   "documentation": "https://github.com/H0ros/HA_TYDOM",
   "issue_tracker": "https://github.com/H0ros/HA_TYDOM/issues",
-  "requirements": ["websockets>=11.0"],
+  "requirements": [
+    "websockets>=11.0",
+    "requests>=2.28.0"
+  ],
   "dependencies": [],
   "codeowners": ["@H0ros"],
-  "iot_class": "local_push",
-  "config_flow": true,
-  "integration_type": "hub"
+  "iot_class": "local_push"
 }

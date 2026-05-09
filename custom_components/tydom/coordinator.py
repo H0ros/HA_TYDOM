@@ -1,229 +1,269 @@
-"""Coordinateur central pour l'intégration Tydom."""
+"""Coordinateur de données pour l'intégration Tydom.
+
+Gère :
+- la connexion/reconnexion au client WebSocket Tydom
+- la récupération initiale des devices (/configs/file + /devices/data + /devices/meta)
+- la mise à jour périodique
+- la distribution des mises à jour push vers les entités HA
+"""
 from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import timedelta
 from typing import Any
 
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
+    CONF_HOST,
+    CONF_MAC,
+    CONF_PASSWORD,
+    DEFAULT_SCAN_INTERVAL,
     DOMAIN,
-    SIGNAL_TYDOM_UPDATE,
-    DEVICE_TYPE_SHUTTER,
-    DEVICE_TYPE_LIGHT,
-    DEVICE_TYPE_SWITCH,
-    DEVICE_TYPE_THERMOSTAT,
-    DEVICE_TYPE_SMOKE,
-    DEVICE_TYPE_GATE,
-    DEVICE_TYPE_GARAGE,
-    DEVICE_TYPE_ALARM,
-    DEVICE_CATEGORY_MAP,
 )
 from .tydom_client import TydomClient
 
 _LOGGER = logging.getLogger(__name__)
 
 
-class TydomCoordinator:
-    """Coordinateur qui gère les données Tydom et dispatche les updates."""
+class TydomDevice:
+    """Représentation d'un device Tydom."""
 
-    def __init__(self, hass: HomeAssistant, client: TydomClient) -> None:
-        """Initialise le coordinateur."""
-        self.hass = hass
-        self.client = client
-        self.devices: dict[str, dict] = {}
-        self.device_configs: dict[str, dict] = {}
-        self._listen_task = None
-        client.callback = self._on_message
+    def __init__(
+        self,
+        device_id: int,
+        endpoint_id: int,
+        name: str,
+        last_usage: str,
+        attributes: dict[str, Any],
+    ) -> None:
+        self.device_id = device_id
+        self.endpoint_id = endpoint_id
+        self.name = name
+        self.last_usage = last_usage
+        self.attributes = dict(attributes)
 
-    async def start(self) -> bool:
-        """Démarre la connexion et l'écoute."""
-        success = await self.client.connect()
-        if not success:
+    @property
+    def unique_id(self) -> str:
+        return f"{self.device_id}_{self.endpoint_id}"
+
+    def update_attributes(self, new_attrs: dict[str, Any]) -> None:
+        self.attributes.update(new_attrs)
+
+    def __repr__(self) -> str:
+        return f"TydomDevice(id={self.device_id}, ep={self.endpoint_id}, name={self.name!r}, usage={self.last_usage})"
+
+
+class TydomCoordinator(DataUpdateCoordinator[dict[str, TydomDevice]]):
+    """Coordinateur central pour la box Tydom."""
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+        super().__init__(
+            hass,
+            _LOGGER,
+            name=DOMAIN,
+            update_interval=timedelta(seconds=DEFAULT_SCAN_INTERVAL),
+        )
+        self._entry = entry
+        mac: str = entry.data[CONF_MAC]
+        password: str = entry.data[CONF_PASSWORD]
+        host: str | None = entry.data.get(CONF_HOST) or None
+
+        self.client = TydomClient(
+            mac=mac,
+            password=password,
+            host=host,
+            message_callback=self._on_push_message,
+        )
+        # Dictionnaire device unique_id → TydomDevice
+        self._devices: dict[str, TydomDevice] = {}
+        self._connected = False
+
+    # ------------------------------------------------------------------
+    # Connexion / déconnexion
+    # ------------------------------------------------------------------
+
+    async def async_connect(self) -> bool:
+        """Ouvre la connexion WebSocket et charge les devices."""
+        if not await self.client.connect():
             return False
-        
-        # Demander les données initiales
-        await self.client.get_devices()
-        await self.client.get_configs()
-        await self.client.get_info()
-        
-        # Lancer la tâche d'écoute en arrière-plan
-        self._listen_task = asyncio.create_task(self.client.listen())
+
+        self._connected = True
+
+        # Chargement initial des devices
+        try:
+            await self._load_devices()
+        except Exception as exc:
+            _LOGGER.error("Erreur lors du chargement initial des devices : %s", exc)
+            # Ne bloque pas l'intégration — on continuera en polling
+
+        # Démarrage de l'écoute push
+        self.client.start_listening()
+
         return True
 
-    async def stop(self) -> None:
-        """Arrête la connexion."""
-        if self._listen_task:
-            self._listen_task.cancel()
-            try:
-                await self._listen_task
-            except asyncio.CancelledError:
-                pass
+    async def async_disconnect(self) -> None:
+        """Ferme proprement la connexion."""
         await self.client.disconnect()
+        self._connected = False
 
-    async def _on_message(self, msg_type: str, data: Any) -> None:
-        """Traite les messages entrants de la box Tydom."""
-        _LOGGER.debug("Message reçu - type: %s, data: %s", msg_type, str(data)[:200])
-        
-        if msg_type == "devices_data":
-            await self._process_devices_data(data)
-        elif msg_type == "devices_config":
-            await self._process_devices_config(data)
-        elif msg_type == "put_response":
-            # Confirmation d'une commande envoyée
-            await self._process_devices_data(data if isinstance(data, list) else [])
+    # ------------------------------------------------------------------
+    # Chargement initial des devices
+    # ------------------------------------------------------------------
 
-    async def _process_devices_data(self, data: list) -> None:
-        """Traite les données des équipements."""
-        if not isinstance(data, list):
+    async def _load_devices(self) -> None:
+        """Charge la liste des devices depuis la box."""
+        _LOGGER.debug("Chargement de /configs/file…")
+        configs = await self.client.get_configs_file()
+        if not configs:
+            _LOGGER.warning("Réponse vide pour /configs/file")
             return
 
-        for device in data:
-            device_id = str(device.get("id", ""))
-            if not device_id:
+        # Extraction de la liste des endpoints depuis configs
+        endpoints_config: list[dict] = []
+        if isinstance(configs, dict):
+            endpoints_config = configs.get("endpoints", [])
+        elif isinstance(configs, list):
+            # Certaines versions renvoient une liste directe
+            endpoints_config = configs
+
+        _LOGGER.debug("%d endpoints trouvés dans /configs/file", len(endpoints_config))
+
+        # Construction d'un dict id_endpoint → config
+        endpoint_cfg_map: dict[int, dict] = {}
+        for ep in endpoints_config:
+            ep_id = ep.get("id_endpoint") or ep.get("id")
+            if ep_id is not None:
+                endpoint_cfg_map[ep_id] = ep
+
+        # Récupération des données courantes
+        _LOGGER.debug("Chargement de /devices/data…")
+        devices_data = await self.client.get_devices_data()
+        if not devices_data:
+            _LOGGER.warning("Réponse vide pour /devices/data")
+            return
+
+        for device_block in devices_data:
+            if not isinstance(device_block, dict):
+                continue
+            device_id = device_block.get("id")
+            if device_id is None:
                 continue
 
-            endpoints = device.get("endpoints", [])
-            for endpoint in endpoints:
-                endpoint_id = str(endpoint.get("id", ""))
-                key = f"{device_id}_{endpoint_id}"
-                
-                # Construire un dictionnaire des valeurs
-                values = {}
-                for ep_data in endpoint.get("data", []):
-                    name = ep_data.get("name")
-                    value = ep_data.get("value")
-                    if name:
-                        values[name] = value
+            for ep in device_block.get("endpoints", []):
+                if ep.get("error", 0) != 0:
+                    continue
+                ep_id = ep.get("id")
+                if ep_id is None:
+                    continue
 
-                if key not in self.devices:
-                    self.devices[key] = {
-                        "device_id": device_id,
-                        "endpoint_id": endpoint_id,
-                        "values": values,
-                    }
+                # Données courantes (liste de {name, value})
+                attrs: dict[str, Any] = {}
+                for item in ep.get("data", []):
+                    attrs[item["name"]] = item["value"]
+
+                # Infos de config
+                cfg = endpoint_cfg_map.get(ep_id, {})
+                name = cfg.get("name", f"Device {ep_id}")
+                last_usage = cfg.get("last_usage", "unknown")
+
+                unique_id = f"{device_id}_{ep_id}"
+                if unique_id in self._devices:
+                    self._devices[unique_id].update_attributes(attrs)
                 else:
-                    self.devices[key]["values"].update(values)
+                    self._devices[unique_id] = TydomDevice(
+                        device_id=device_id,
+                        endpoint_id=ep_id,
+                        name=name,
+                        last_usage=last_usage,
+                        attributes=attrs,
+                    )
 
-                # Notifier les entités de la mise à jour
-                signal = f"{SIGNAL_TYDOM_UPDATE}_{key}"
-                async_dispatcher_send(self.hass, signal, self.devices[key])
+        _LOGGER.info("%d devices chargés depuis la box Tydom", len(self._devices))
+        for d in self._devices.values():
+            _LOGGER.debug("  → %s", d)
 
-    async def _process_devices_config(self, data: list) -> None:
-        """Traite la configuration des équipements (nom, type...)."""
+    # ------------------------------------------------------------------
+    # Mise à jour périodique (DataUpdateCoordinator)
+    # ------------------------------------------------------------------
+
+    async def _async_update_data(self) -> dict[str, TydomDevice]:
+        """Mise à jour périodique — polling de /devices/data."""
+        if not self.client.is_connected:
+            _LOGGER.warning("Client Tydom déconnecté, tentative de reconnexion…")
+            if not await self.client.connect():
+                raise UpdateFailed("Impossible de se reconnecter à la box Tydom")
+            self.client.start_listening()
+
+        try:
+            devices_data = await self.client.get_devices_data()
+        except Exception as exc:
+            raise UpdateFailed(f"Erreur lors de /devices/data : {exc}") from exc
+
+        if devices_data:
+            for device_block in devices_data:
+                if not isinstance(device_block, dict):
+                    continue
+                device_id = device_block.get("id")
+                for ep in device_block.get("endpoints", []):
+                    if ep.get("error", 0) != 0:
+                        continue
+                    ep_id = ep.get("id")
+                    if ep_id is None:
+                        continue
+                    unique_id = f"{device_id}_{ep_id}"
+                    attrs = {item["name"]: item["value"] for item in ep.get("data", [])}
+                    if unique_id in self._devices:
+                        self._devices[unique_id].update_attributes(attrs)
+
+        return dict(self._devices)
+
+    # ------------------------------------------------------------------
+    # Messages push
+    # ------------------------------------------------------------------
+
+    @callback
+    def _on_push_message(self, uri_origin: str, data: Any) -> None:
+        """Callback appelé par le client lors d'un message push Tydom."""
+        _LOGGER.debug("Message push [%s] reçu", uri_origin)
+
         if not isinstance(data, list):
             return
 
-        for device in data:
-            device_id = str(device.get("id", ""))
-            if not device_id:
+        updated = False
+        for device_block in data:
+            if not isinstance(device_block, dict):
                 continue
+            device_id = device_block.get("id")
+            for ep in device_block.get("endpoints", []):
+                if ep.get("error", 0) != 0:
+                    continue
+                ep_id = ep.get("id")
+                if ep_id is None:
+                    continue
+                unique_id = f"{device_id}_{ep_id}"
+                attrs = {item["name"]: item["value"] for item in ep.get("data", [])}
+                if unique_id in self._devices:
+                    self._devices[unique_id].update_attributes(attrs)
+                    updated = True
 
-            endpoints = device.get("endpoints", [])
-            for endpoint in endpoints:
-                endpoint_id = str(endpoint.get("id", ""))
-                key = f"{device_id}_{endpoint_id}"
-                
-                self.device_configs[key] = {
-                    "device_id": device_id,
-                    "endpoint_id": endpoint_id,
-                    "name": endpoint.get("name", f"Tydom {key}"),
-                    "type": endpoint.get("type", ""),
-                    "last_usage": endpoint.get("last_usage", ""),
-                    "categories": device.get("categories", []),
-                }
+        if updated:
+            # Notifie tous les abonnés (entités HA)
+            self.async_set_updated_data(dict(self._devices))
 
-                _LOGGER.debug(
-                    "Config device %s: name=%s, type=%s",
-                    key,
-                    self.device_configs[key]["name"],
-                    self.device_configs[key]["type"],
-                )
+    # ------------------------------------------------------------------
+    # Accès aux devices
+    # ------------------------------------------------------------------
 
-    def get_device_type(self, key: str) -> str:
-        """Détermine le type HA d'un équipement."""
-        config = self.device_configs.get(key, {})
-        ep_type = config.get("type", "").upper()
-        last_usage = config.get("last_usage", "").upper()
-        
-        # Correspondance des types Tydom vers les catégories HA
-        for tydom_type, ha_type in DEVICE_CATEGORY_MAP.items():
-            if tydom_type in ep_type or tydom_type in last_usage:
-                return ha_type
-        
-        # Déduction depuis les valeurs disponibles
-        values = self.devices.get(key, {}).get("values", {})
-        if "position" in values or "thermPosition" in values:
-            return DEVICE_TYPE_SHUTTER
-        if "onFav" in values or "level" in values:
-            return DEVICE_TYPE_LIGHT
-        if "onState" in values:
-            return DEVICE_TYPE_SWITCH
-        if "setpoint" in values or "thermSetpoint" in values:
-            return DEVICE_TYPE_THERMOSTAT
-        
-        return "unknown"
+    @property
+    def devices(self) -> dict[str, TydomDevice]:
+        return self._devices
 
-    def get_all_devices_by_type(self, device_type: str) -> list[str]:
-        """Retourne tous les devices d'un type donné."""
-        result = []
-        for key in set(list(self.devices.keys()) + list(self.device_configs.keys())):
-            if self.get_device_type(key) == device_type:
-                result.append(key)
-        return result
+    def get_device(self, unique_id: str) -> TydomDevice | None:
+        return self._devices.get(unique_id)
 
-    async def refresh(self) -> None:
-        """Demande un rafraîchissement complet."""
-        await self.client.refresh_all()
-        await self.client.get_devices()
-
-    async def set_cover_position(self, device_id: str, endpoint_id: str, position: int) -> None:
-        """Commande la position d'un volet (0=fermé, 100=ouvert)."""
-        # Tydom utilise une position inversée parfois selon les modèles
-        await self.client.set_device_data(
-            device_id,
-            endpoint_id,
-            [{"name": "position", "value": position}],
-        )
-
-    async def set_cover_command(self, device_id: str, endpoint_id: str, command: str) -> None:
-        """Envoie une commande à un volet (UP, DOWN, STOP)."""
-        await self.client.set_device_data(
-            device_id,
-            endpoint_id,
-            [{"name": "thermPosition", "value": command}],
-        )
-
-    async def set_light_state(self, device_id: str, endpoint_id: str, state: bool) -> None:
-        """Allume ou éteint une lumière."""
-        await self.client.set_device_data(
-            device_id,
-            endpoint_id,
-            [{"name": "onFav", "value": state}],
-        )
-
-    async def set_light_level(self, device_id: str, endpoint_id: str, level: int) -> None:
-        """Règle le niveau d'une lumière dimmable (0-100)."""
-        await self.client.set_device_data(
-            device_id,
-            endpoint_id,
-            [{"name": "level", "value": level}],
-        )
-
-    async def set_switch_state(self, device_id: str, endpoint_id: str, state: bool) -> None:
-        """Allume ou éteint un interrupteur."""
-        await self.client.set_device_data(
-            device_id,
-            endpoint_id,
-            [{"name": "onState", "value": state}],
-        )
-
-    async def set_thermostat_setpoint(self, device_id: str, endpoint_id: str, temperature: float) -> None:
-        """Règle la consigne de température."""
-        await self.client.set_device_data(
-            device_id,
-            endpoint_id,
-            [{"name": "setpoint", "value": temperature}],
-        )
+    def devices_by_usage(self, usage: str) -> list[TydomDevice]:
+        return [d for d in self._devices.values() if d.last_usage == usage]

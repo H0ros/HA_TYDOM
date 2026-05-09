@@ -1,4 +1,4 @@
-"""Plateforme Sensor pour Tydom (températures, énergie…)."""
+"""Plateforme sensor (capteurs numériques) pour Tydom."""
 from __future__ import annotations
 
 import logging
@@ -8,24 +8,48 @@ from homeassistant.components.sensor import (
     SensorEntity,
     SensorStateClass,
 )
-from homeassistant.const import UnitOfTemperature, UnitOfEnergy, UnitOfPower
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import (
+    PERCENTAGE,
+    UnitOfTemperature,
+    CONCENTRATION_PARTS_PER_MILLION,
+)
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN, SIGNAL_TYDOM_UPDATE
-from .coordinator import TydomCoordinator
+from .const import DOMAIN
+from .coordinator import TydomCoordinator, TydomDevice
 
 _LOGGER = logging.getLogger(__name__)
 
-# Capteurs supplémentaires extraits de chaque équipement
-EXTRA_SENSORS = {
-    "temperature": (SensorDeviceClass.TEMPERATURE, UnitOfTemperature.CELSIUS, SensorStateClass.MEASUREMENT),
-    "batteryLevel": (SensorDeviceClass.BATTERY, "%", SensorStateClass.MEASUREMENT),
-    "energyIndex": (SensorDeviceClass.ENERGY, UnitOfEnergy.KILO_WATT_HOUR, SensorStateClass.TOTAL_INCREASING),
-    "power": (SensorDeviceClass.POWER, UnitOfPower.WATT, SensorStateClass.MEASUREMENT),
+_SENSOR_USAGES = {"temperature_sensor", "humidity_sensor", "co2_sensor", "battery"}
+
+_USAGE_CONFIG: dict[str, dict] = {
+    "temperature_sensor": {
+        "attr": "temperature",
+        "unit": UnitOfTemperature.CELSIUS,
+        "device_class": SensorDeviceClass.TEMPERATURE,
+        "state_class": SensorStateClass.MEASUREMENT,
+    },
+    "humidity_sensor": {
+        "attr": "humidity",
+        "unit": PERCENTAGE,
+        "device_class": SensorDeviceClass.HUMIDITY,
+        "state_class": SensorStateClass.MEASUREMENT,
+    },
+    "co2_sensor": {
+        "attr": "co2Level",
+        "unit": CONCENTRATION_PARTS_PER_MILLION,
+        "device_class": SensorDeviceClass.CO2,
+        "state_class": SensorStateClass.MEASUREMENT,
+    },
+    "battery": {
+        "attr": "batteryLevel",
+        "unit": PERCENTAGE,
+        "device_class": SensorDeviceClass.BATTERY,
+        "state_class": SensorStateClass.MEASUREMENT,
+    },
 }
 
 
@@ -35,82 +59,49 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     coordinator: TydomCoordinator = hass.data[DOMAIN][entry.entry_id]
-    entities_added: set[str] = set()
-
-    @callback
-    def _check_new_sensors() -> None:
-        new_entities = []
-        for key, device_data in coordinator.devices.items():
-            values = device_data.get("values", {})
-            config = coordinator.device_configs.get(key, {})
-            for value_name, (dev_class, unit, state_class) in EXTRA_SENSORS.items():
-                sensor_key = f"{key}_{value_name}"
-                if value_name in values and sensor_key not in entities_added:
-                    entities_added.add(sensor_key)
-                    new_entities.append(
-                        TydomSensor(
-                            coordinator=coordinator,
-                            key=key,
-                            sensor_key=sensor_key,
-                            value_name=value_name,
-                            name=f"{config.get('name', key)} {value_name}",
-                            device_class=dev_class,
-                            unit=unit,
-                            state_class=state_class,
-                        )
-                    )
-        if new_entities:
-            async_add_entities(new_entities)
-
-    entry.async_on_unload(
-        async_dispatcher_connect(hass, f"{SIGNAL_TYDOM_UPDATE}_new", lambda _: _check_new_sensors())
-    )
-    _check_new_sensors()
+    entities = [
+        TydomSensor(coordinator, device)
+        for device in coordinator.devices.values()
+        if device.last_usage in _SENSOR_USAGES
+    ]
+    _LOGGER.debug("Ajout de %d entités sensor Tydom", len(entities))
+    async_add_entities(entities)
 
 
-class TydomSensor(SensorEntity):
-    """Représente un capteur de valeur Tydom."""
+class TydomSensor(CoordinatorEntity[TydomCoordinator], SensorEntity):
+    """Capteur numérique Tydom."""
 
     _attr_has_entity_name = True
-    _attr_should_poll = False
 
-    def __init__(self, coordinator, key, sensor_key, value_name, name, device_class, unit, state_class):
-        self._coordinator = coordinator
-        self._key = key
-        self._value_name = value_name
-        self._attr_unique_id = f"tydom_sensor_{sensor_key}"
-        self._attr_name = name
-        self._attr_device_class = device_class
-        self._attr_native_unit_of_measurement = unit
-        self._attr_state_class = state_class
-        self._attr_native_value = None
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, key)},
-            name=name,
-            manufacturer="Delta Dore",
-            model="Tydom",
-        )
+    def __init__(self, coordinator: TydomCoordinator, device: TydomDevice) -> None:
+        super().__init__(coordinator)
+        self._device_uid = device.unique_id
+        self._attr_unique_id = f"tydom_{device.unique_id}"
+        self._attr_name = device.name
 
-    async def async_added_to_hass(self) -> None:
-        self.async_on_remove(
-            async_dispatcher_connect(
-                self.hass,
-                f"{SIGNAL_TYDOM_UPDATE}_{self._key}",
-                self._handle_update,
-            )
-        )
-        self._update_from_coordinator()
+        cfg = _USAGE_CONFIG.get(device.last_usage, {})
+        self._value_attr: str = cfg.get("attr", "value")
+        self._attr_native_unit_of_measurement = cfg.get("unit")
+        self._attr_device_class = cfg.get("device_class")
+        self._attr_state_class = cfg.get("state_class")
+
+    @property
+    def _device(self) -> TydomDevice | None:
+        return self.coordinator.get_device(self._device_uid)
+
+    @property
+    def native_value(self):
+        d = self._device
+        if d is None:
+            return None
+        val = d.attributes.get(self._value_attr)
+        if val is None:
+            # Fallback : cherche le premier attribut numérique
+            for v in d.attributes.values():
+                if isinstance(v, (int, float)):
+                    return v
+        return val
 
     @callback
-    def _handle_update(self, data: dict) -> None:
-        self._update_from_coordinator()
+    def _handle_coordinator_update(self) -> None:
         self.async_write_ha_state()
-
-    def _update_from_coordinator(self) -> None:
-        values = self._coordinator.devices.get(self._key, {}).get("values", {})
-        raw = values.get(self._value_name)
-        if raw is not None:
-            try:
-                self._attr_native_value = float(raw)
-            except (ValueError, TypeError):
-                self._attr_native_value = raw

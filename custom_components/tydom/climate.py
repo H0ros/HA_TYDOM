@@ -1,4 +1,4 @@
-"""Plateforme Climate (thermostat) pour Tydom."""
+"""Plateforme climate (thermostats, chaudières) pour Tydom."""
 from __future__ import annotations
 
 import logging
@@ -9,17 +9,34 @@ from homeassistant.components.climate import (
     ClimateEntityFeature,
     HVACMode,
 )
-from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN, SIGNAL_TYDOM_UPDATE, DEVICE_TYPE_THERMOSTAT
-from .coordinator import TydomCoordinator
+from .const import DOMAIN
+from .coordinator import TydomCoordinator, TydomDevice
 
 _LOGGER = logging.getLogger(__name__)
+
+_CLIMATE_USAGES = {"boiler", "electric_heater", "hvac", "thermostat"}
+
+_TYDOM_TO_HVAC: dict[str, HVACMode] = {
+    "HEATING": HVACMode.HEAT,
+    "COOLING": HVACMode.COOL,
+    "AUTO": HVACMode.AUTO,
+    "OFF": HVACMode.OFF,
+    "STOP": HVACMode.OFF,
+    "ANTI_FROST": HVACMode.AUTO,
+}
+
+_HVAC_TO_TYDOM: dict[HVACMode, str] = {
+    HVACMode.HEAT: "HEATING",
+    HVACMode.COOL: "COOLING",
+    HVACMode.AUTO: "AUTO",
+    HVACMode.OFF: "STOP",
+}
 
 
 async def async_setup_entry(
@@ -28,132 +45,77 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     coordinator: TydomCoordinator = hass.data[DOMAIN][entry.entry_id]
-    entities_added: set[str] = set()
-
-    @callback
-    def _check_new_thermostats() -> None:
-        new_entities = []
-        for key in coordinator.get_all_devices_by_type(DEVICE_TYPE_THERMOSTAT):
-            if key not in entities_added:
-                entities_added.add(key)
-                config = coordinator.device_configs.get(key, {})
-                new_entities.append(
-                    TydomClimate(
-                        coordinator=coordinator,
-                        key=key,
-                        device_id=config.get("device_id", key.split("_")[0]),
-                        endpoint_id=config.get("endpoint_id", key.split("_")[1] if "_" in key else "0"),
-                        name=config.get("name", f"Thermostat {key}"),
-                    )
-                )
-        if new_entities:
-            async_add_entities(new_entities)
-
-    entry.async_on_unload(
-        async_dispatcher_connect(hass, f"{SIGNAL_TYDOM_UPDATE}_config", lambda _: _check_new_thermostats())
-    )
-    _check_new_thermostats()
+    entities = [
+        TydomClimate(coordinator, device)
+        for device in coordinator.devices.values()
+        if device.last_usage in _CLIMATE_USAGES
+    ]
+    _LOGGER.debug("Ajout de %d entités climate Tydom", len(entities))
+    async_add_entities(entities)
 
 
-class TydomClimate(ClimateEntity):
-    """Représente un thermostat Tydom."""
+class TydomClimate(CoordinatorEntity[TydomCoordinator], ClimateEntity):
+    """Thermostat/chaudière Tydom."""
 
     _attr_has_entity_name = True
-    _attr_should_poll = False
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
-    _attr_hvac_modes = [HVACMode.HEAT, HVACMode.OFF, HVACMode.AUTO]
-    _attr_supported_features = ClimateEntityFeature.TARGET_TEMPERATURE
-    _attr_min_temp = 5.0
-    _attr_max_temp = 30.0
-    _attr_target_temperature_step = 0.5
+    _attr_hvac_modes = [HVACMode.HEAT, HVACMode.AUTO, HVACMode.OFF]
+    _attr_supported_features = (
+        ClimateEntityFeature.TARGET_TEMPERATURE
+    )
 
-    def __init__(self, coordinator, key, device_id, endpoint_id, name):
-        self._coordinator = coordinator
-        self._key = key
-        self._device_id = device_id
-        self._endpoint_id = endpoint_id
-        self._attr_unique_id = f"tydom_climate_{key}"
-        self._attr_name = name
-        self._current_temperature: float | None = None
-        self._target_temperature: float | None = None
-        self._hvac_mode: HVACMode = HVACMode.AUTO
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, key)},
-            name=name,
-            manufacturer="Delta Dore",
-            model="Tydom",
-        )
+    def __init__(self, coordinator: TydomCoordinator, device: TydomDevice) -> None:
+        super().__init__(coordinator)
+        self._device_uid = device.unique_id
+        self._attr_unique_id = f"tydom_{device.unique_id}"
+        self._attr_name = device.name
 
-    async def async_added_to_hass(self) -> None:
-        self.async_on_remove(
-            async_dispatcher_connect(
-                self.hass,
-                f"{SIGNAL_TYDOM_UPDATE}_{self._key}",
-                self._handle_update,
-            )
-        )
-        self._update_from_coordinator()
-
-    @callback
-    def _handle_update(self, data: dict) -> None:
-        self._update_from_coordinator()
-        self.async_write_ha_state()
-
-    def _update_from_coordinator(self) -> None:
-        values = self._coordinator.devices.get(self._key, {}).get("values", {})
-        
-        temp = values.get("temperature") or values.get("currentTemperature")
-        if temp is not None:
-            try:
-                self._current_temperature = float(temp)
-            except (ValueError, TypeError):
-                pass
-
-        setpoint = values.get("setpoint") or values.get("thermSetpoint")
-        if setpoint is not None:
-            try:
-                self._target_temperature = float(setpoint)
-            except (ValueError, TypeError):
-                pass
-
-        authorization = values.get("authorization", "HEATING")
-        if authorization == "STOP":
-            self._hvac_mode = HVACMode.OFF
-        elif authorization == "HEATING":
-            self._hvac_mode = HVACMode.HEAT
-        else:
-            self._hvac_mode = HVACMode.AUTO
+    @property
+    def _device(self) -> TydomDevice | None:
+        return self.coordinator.get_device(self._device_uid)
 
     @property
     def current_temperature(self) -> float | None:
-        return self._current_temperature
+        d = self._device
+        if d is None:
+            return None
+        t = d.attributes.get("temperature") or d.attributes.get("currentTemperature")
+        return float(t) if t is not None else None
 
     @property
     def target_temperature(self) -> float | None:
-        return self._target_temperature
+        d = self._device
+        if d is None:
+            return None
+        t = d.attributes.get("setpoint") or d.attributes.get("targetTemperature")
+        return float(t) if t is not None else None
 
     @property
     def hvac_mode(self) -> HVACMode:
-        return self._hvac_mode
+        d = self._device
+        if d is None:
+            return HVACMode.OFF
+        mode = d.attributes.get("hvacMode") or d.attributes.get("authorization")
+        if mode:
+            return _TYDOM_TO_HVAC.get(str(mode).upper(), HVACMode.AUTO)
+        return HVACMode.AUTO
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
         temp = kwargs.get(ATTR_TEMPERATURE)
-        if temp is not None:
-            self._target_temperature = temp
-            self.async_write_ha_state()
-            await self._coordinator.set_thermostat_setpoint(self._device_id, self._endpoint_id, temp)
+        d = self._device
+        if d and temp is not None:
+            await self.coordinator.client.put_device_data(
+                d.device_id, d.endpoint_id, "setpoint", temp
+            )
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
-        self._hvac_mode = hvac_mode
+        d = self._device
+        if d:
+            tydom_mode = _HVAC_TO_TYDOM.get(hvac_mode, "AUTO")
+            await self.coordinator.client.put_device_data(
+                d.device_id, d.endpoint_id, "hvacMode", tydom_mode
+            )
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
         self.async_write_ha_state()
-        authorization_map = {
-            HVACMode.OFF: "STOP",
-            HVACMode.HEAT: "HEATING",
-            HVACMode.AUTO: "AUTO",
-        }
-        value = authorization_map.get(hvac_mode, "AUTO")
-        await self._coordinator.client.set_device_data(
-            self._device_id,
-            self._endpoint_id,
-            [{"name": "authorization", "value": value}],
-        )
