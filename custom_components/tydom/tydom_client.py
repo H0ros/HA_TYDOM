@@ -98,7 +98,7 @@ def _calc_digest(mac: str, password: str, realm: str, nonce: str, uri: str, opaq
     ha1      = hashlib.md5(f"{mac}:{realm}:{password}".encode()).hexdigest()
     ha2      = hashlib.md5(f"GET:{uri}".encode()).hexdigest()
     nc       = "00000001"
-    cnonce   = base64.b64encode(os.urandom(8)).decode("ascii")
+    cnonce   = os.urandom(8).hex()  # hex uniquement — pas de / ni = comme en base64
     response = hashlib.md5(f"{ha1}:{nonce}:{nc}:{cnonce}:auth:{ha2}".encode()).hexdigest()
     header = (
         f'Digest username="{mac}", realm="{realm}", '
@@ -151,7 +151,7 @@ def _get_challenge_with_ws_headers_sync(
 
     chal   = _parse_www_auth(www_auth)
     nonce  = chal.get("nonce", "")
-    realm  = chal.get("realm", "Protected Area")
+    realm  = chal.get("realm", "Protected Area").lower()  # tydom2mqtt force le realm en minuscules
     opaque = chal.get("opaque", "")
     _LOGGER.debug("[TYDOM] realm=%r  nonce=%s  opaque=%s", realm, nonce, opaque)
     return realm, nonce, opaque
