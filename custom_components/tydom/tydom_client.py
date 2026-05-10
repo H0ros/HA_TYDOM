@@ -94,18 +94,21 @@ def _parse_www_auth(www_auth: str) -> dict[str, str]:
     return chal
 
 
-def _calc_digest(mac: str, password: str, realm: str, nonce: str, uri: str) -> str:
+def _calc_digest(mac: str, password: str, realm: str, nonce: str, uri: str, opaque: str = "") -> str:
     ha1      = hashlib.md5(f"{mac}:{realm}:{password}".encode()).hexdigest()
     ha2      = hashlib.md5(f"GET:{uri}".encode()).hexdigest()
     nc       = "00000001"
     cnonce   = hashlib.md5(b"tydom_ha").hexdigest()[:8]
     response = hashlib.md5(f"{ha1}:{nonce}:{nc}:{cnonce}:auth:{ha2}".encode()).hexdigest()
-    return (
+    header = (
         f'Digest username="{mac}", realm="{realm}", '
         f'nonce="{nonce}", uri="{uri}", '
         f'response="{response}", '
         f'qop=auth, nc={nc}, cnonce="{cnonce}"'
     )
+    if opaque:
+        header += f', opaque="{opaque}"'
+    return header
 
 
 # ---------------------------------------------------------------------------
@@ -146,11 +149,12 @@ def _get_challenge_with_ws_headers_sync(
             "Vérifiez l'adresse IP et la MAC."
         )
 
-    chal  = _parse_www_auth(www_auth)
-    nonce = chal.get("nonce", "")
-    realm = chal.get("realm", "Protected Area")
-    _LOGGER.debug("[TYDOM] realm=%r  nonce=%s", realm, nonce)
-    return realm, nonce
+    chal   = _parse_www_auth(www_auth)
+    nonce  = chal.get("nonce", "")
+    realm  = chal.get("realm", "Protected Area")
+    opaque = chal.get("opaque", "")
+    _LOGGER.debug("[TYDOM] realm=%r  nonce=%s  opaque=%s", realm, nonce, opaque)
+    return realm, nonce, opaque
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +197,7 @@ class TydomClient:
 
         # Étape 1 — nonce via requête avec headers WebSocket (executor)
         try:
-            realm, nonce = await loop.run_in_executor(
+            realm, nonce, opaque = await loop.run_in_executor(
                 None, _get_challenge_with_ws_headers_sync,
                 self._host, TYDOM_PORT, self._mac, ssl_context,
             )
@@ -203,7 +207,7 @@ class TydomClient:
 
         # Étape 2 — Authorization Digest + websockets.connect()
         uri           = MEDIATION_URI.format(mac=self._mac)
-        authorization = _calc_digest(self._mac, self._password, realm, nonce, uri)
+        authorization = _calc_digest(self._mac, self._password, realm, nonce, uri, opaque)
         _LOGGER.debug("[TYDOM] Authorization: %s", authorization)
 
         ws_uri = f"wss://{self._host}:{TYDOM_PORT}{uri}"
