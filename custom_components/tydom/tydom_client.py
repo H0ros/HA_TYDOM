@@ -151,11 +151,11 @@ def _do_full_handshake_sync(
     r1 = conn.getresponse()
     s1, h1 = r1.status, dict(r1.headers)
     r1.read()
+    conn.close()
     _LOGGER.debug("[TYDOM] Réponse 1 : status=%d, Connection=%s", s1, h1.get("Connection", ""))
 
     www_auth_1 = h1.get("WWW-Authenticate") or h1.get("www-authenticate") or ""
     if s1 != 401 or not www_auth_1:
-        conn.close()
         raise ConnectionError(f"Réponse inattendue req1 : status={s1}, headers={h1}")
 
     chal_1 = _parse_www_auth(www_auth_1)
@@ -163,30 +163,25 @@ def _do_full_handshake_sync(
     realm   = chal_1.get("realm", "Protected Area")
     _LOGGER.debug("[TYDOM] nonce_A=%s  realm=%r", nonce_a, realm)
 
-    # Si la box a fermé la connexion, réouvrir
-    if "close" in h1.get("Connection", "").lower():
-        _LOGGER.debug("[TYDOM] Connection: close détecté — réouverture TCP pour req 2")
-        conn.close()
-        conn = http.client.HTTPSConnection(host, port, context=ssl_context, timeout=10)
-
-    # ---- Requête 2 : avec Digest(nonce_A) → 401 + nonce_B ----
+    # ---- Requête 2 : nouvelle connexion + Digest(nonce_A) → 401 + nonce_B ----
     auth_a = _calc_digest(mac, password, realm, nonce_a, uri)
-    _LOGGER.debug("[TYDOM] Req 2 (auth avec nonce_A)…")
+    _LOGGER.debug("[TYDOM] Req 2 Authorization: %s", auth_a)
+    conn = http.client.HTTPSConnection(host, port, context=ssl_context, timeout=10)
     conn.request("GET", uri, None, make_ws_headers(auth_a))
     r2 = conn.getresponse()
     s2, h2 = r2.status, dict(r2.headers)
-    r2.read()
     _LOGGER.debug("[TYDOM] Réponse 2 : status=%d", s2)
 
     if s2 == 101:
-        # Certaines boxes acceptent dès la requête 2 (firmware plus récent)
         _LOGGER.debug("[TYDOM] Connexion acceptée dès req 2 (101)")
         raw_sock = conn.sock
         conn.sock = None
         return raw_sock
 
+    r2.read()
+    conn.close()
+
     if s2 != 401:
-        conn.close()
         raise ConnectionError(f"Réponse inattendue req2 : status={s2}, headers={h2}")
 
     www_auth_2 = h2.get("WWW-Authenticate") or h2.get("www-authenticate") or ""
@@ -195,26 +190,31 @@ def _do_full_handshake_sync(
     realm   = chal_2.get("realm", realm)
     _LOGGER.debug("[TYDOM] nonce_B=%s  realm=%r", nonce_b, realm)
 
-    if "close" in h2.get("Connection", "").lower():
-        _LOGGER.debug("[TYDOM] Connection: close détecté — réouverture TCP pour req 3")
-        conn.close()
-        conn = http.client.HTTPSConnection(host, port, context=ssl_context, timeout=10)
-
-    # ---- Requête 3 : avec Digest(nonce_B) → 101 ----
+    # ---- Requête 3 : nouvelle connexion + Digest(nonce_B) → 101 ----
     auth_b = _calc_digest(mac, password, realm, nonce_b, uri)
-    _LOGGER.debug("[TYDOM] Req 3 (auth avec nonce_B)…")
+    _LOGGER.debug("[TYDOM] Req 3 Authorization: %s", auth_b)
+    conn = http.client.HTTPSConnection(host, port, context=ssl_context, timeout=10)
     conn.request("GET", uri, None, make_ws_headers(auth_b))
     r3 = conn.getresponse()
     s3, h3 = r3.status, dict(r3.headers)
-    _LOGGER.debug("[TYDOM] Réponse 3 : status=%d", s3)
+    body3 = r3.read()
+    www_auth_3 = h3.get("WWW-Authenticate") or h3.get("www-authenticate") or ""
+    _LOGGER.debug("[TYDOM] Réponse 3 : status=%d, WWW-Auth=%s", s3, www_auth_3)
+    _LOGGER.debug("[TYDOM] Réponse 3 headers complets : %s", h3)
+
+    # Log de vérification du calcul Digest
+    import hashlib as _hlib
+    _ha1 = _hlib.md5(f"{mac}:{realm}:{password}".encode()).hexdigest()
+    _ha2 = _hlib.md5(f"GET:{uri}".encode()).hexdigest()
+    _LOGGER.debug("[TYDOM] Vérif calcul — mac=%r password=%r realm=%r", mac, password, realm)
+    _LOGGER.debug("[TYDOM] ha1=%s  ha2=%s", _ha1, _ha2)
 
     if s3 != 101:
-        body3 = r3.read()
         conn.close()
         raise PermissionError(
             f"Échec après 3 tentatives (status={s3}). "
-            f"Vérifiez le mot de passe — par défaut Tydom 1 = "
-            f"6 derniers caractères de la MAC en majuscules (ex: 08846E). "
+            f"WWW-Auth reçu: {www_auth_3!r}. "
+            f"Calcul: mac={mac!r}, realm={realm!r}, password_len={len(password)}. "
             f"Body={body3[:200]!r}"
         )
 
