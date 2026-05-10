@@ -104,7 +104,7 @@ def _calc_digest(mac: str, password: str, realm: str, nonce: str, uri: str, opaq
         f'Digest username="{mac}", realm="{realm}", '
         f'nonce="{nonce}", uri="{uri}", '
         f'response="{response}", '
-        f'qop=auth, nc={nc}, cnonce="{cnonce}"'
+        f'qop="auth", nc={nc}, cnonce="{cnonce}"'
     )
     if opaque:
         header += f', opaque="{opaque}"'
