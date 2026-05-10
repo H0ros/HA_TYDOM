@@ -1,13 +1,14 @@
 """Client WebSocket pour la box Tydom de Delta Dore.
 
-Protocole de connexion (3 requêtes sur la même connexion TCP) :
-  Req 1 : GET sans Authorization            → 401 + nonce_A
-  Req 2 : GET + Digest(nonce_A)             → 401 + nonce_B  (la box invalide nonce_A)
-  Req 3 : GET + Digest(nonce_B)             → 101 Switching Protocols ✓
+Flow de connexion (identique à tydom2mqtt) :
+  1. Requête HTTP simple → 401 + WWW-Authenticate: Digest (nonce_A)
+  2. Calcul Authorization Digest avec nonce_A
+  3. websockets.connect() avec Authorization dans les headers → 101 ✓
 
-La box Tydom invalide systématiquement le premier nonce et en génère un nouveau.
-C'est pour ça que toute approche en 2 requêtes échoue avec HTTP 401.
-Le realm exact est "Protected Area" (sensible à la casse).
+Le nonce reste valide entre l'étape 1 et 3 car la box ne le lie pas
+à la connexion TCP, contrairement à ce qu'on croyait.
+Le vrai problème précédent était l'utilisation de sock=raw_sock qui
+perturbait le handshake WebSocket de la librairie websockets.
 """
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ import asyncio
 import base64
 import hashlib
 import http.client
+import inspect
 import json
 import logging
 import os
@@ -32,7 +34,7 @@ TYDOM_REMOTE_HOST = "mediation.tydom.com"
 
 
 # ---------------------------------------------------------------------------
-# Helpers de parsing des réponses WebSocket encapsulées
+# Helpers parsing réponses WebSocket encapsulées
 # ---------------------------------------------------------------------------
 
 def _parse_chunked_body(raw: str) -> str:
@@ -87,8 +89,14 @@ def _get_uri_origin(raw_bytes: bytes, cmd_prefix: str = "") -> str | None:
 # Calcul Digest RFC 2617
 # ---------------------------------------------------------------------------
 
+def _parse_www_auth(www_auth: str) -> dict[str, str]:
+    chal: dict[str, str] = {}
+    for m in re.finditer(r'(\w+)=(?:"([^"]*)"|([\w./+=-]+))', www_auth):
+        chal[m.group(1)] = m.group(2) if m.group(2) is not None else m.group(3)
+    return chal
+
+
 def _calc_digest(mac: str, password: str, realm: str, nonce: str, uri: str) -> str:
-    """Calcule l'Authorization Digest RFC 2617 (qop=auth, nc=00000001)."""
     ha1      = hashlib.md5(f"{mac}:{realm}:{password}".encode()).hexdigest()
     ha2      = hashlib.md5(f"GET:{uri}".encode()).hexdigest()
     nc       = "00000001"
@@ -102,125 +110,44 @@ def _calc_digest(mac: str, password: str, realm: str, nonce: str, uri: str) -> s
     )
 
 
-def _parse_www_auth(www_auth: str) -> dict[str, str]:
-    """Parse le header WWW-Authenticate: Digest ..."""
-    chal: dict[str, str] = {}
-    for m in re.finditer(r'(\w+)=(?:"([^"]*)"|([\w./+=-]+))', www_auth):
-        chal[m.group(1)] = m.group(2) if m.group(2) is not None else m.group(3)
-    return chal
-
-
 # ---------------------------------------------------------------------------
-# Handshake complet (3 requêtes) — synchrone → executor
+# Récupération du nonce (synchrone → executor)
 # ---------------------------------------------------------------------------
 
-def _do_full_handshake_sync(
-    host: str, port: int, mac: str, password: str, ssl_context: ssl.SSLContext
-):
-    """Effectue les 3 échanges HTTP nécessaires sur la même connexion TCP.
+def _get_digest_challenge_sync(
+    host: str, port: int, mac: str, ssl_context: ssl.SSLContext
+) -> tuple[str, str]:
+    """Requête HTTP simple pour obtenir le challenge Digest.
 
-    La box Tydom invalide le premier nonce et en émet un second.
-    Il faut donc :
-      1. GET sans auth           → 401 + nonce_A
-      2. GET + Digest(nonce_A)   → 401 + nonce_B
-      3. GET + Digest(nonce_B)   → 101 Switching Protocols
-
-    Retourne le socket TLS prêt pour WebSocket, ou lève une exception.
+    Retourne (realm, nonce).
     Synchrone — appelé via loop.run_in_executor().
     """
     uri = MEDIATION_URI.format(mac=mac)
-
-    def make_ws_headers(authorization: str | None = None) -> dict:
-        h = {
-            "Connection": "Upgrade",
-            "Upgrade": "websocket",
-            "Host": f"{host}:{port}",
-            "Accept": "*/*",
-            "Sec-WebSocket-Version": "13",
-            "Sec-WebSocket-Key": base64.b64encode(os.urandom(16)).decode("ascii"),
-        }
-        if authorization:
-            h["Authorization"] = authorization
-        return h
-
+    # Requête HTTP basique sans headers WebSocket, comme tydom2mqtt
+    headers = {
+        "Host": host,
+        "Accept": "*/*",
+    }
     conn = http.client.HTTPSConnection(host, port, context=ssl_context, timeout=10)
-
-    # ---- Requête 1 : sans Authorization → 401 + nonce_A ----
-    _LOGGER.debug("[TYDOM] Req 1 (sans auth)…")
-    conn.request("GET", uri, None, make_ws_headers())
-    r1 = conn.getresponse()
-    s1, h1 = r1.status, dict(r1.headers)
-    r1.read()
-    conn.close()
-    _LOGGER.debug("[TYDOM] Réponse 1 : status=%d, Connection=%s", s1, h1.get("Connection", ""))
-
-    www_auth_1 = h1.get("WWW-Authenticate") or h1.get("www-authenticate") or ""
-    if s1 != 401 or not www_auth_1:
-        raise ConnectionError(f"Réponse inattendue req1 : status={s1}, headers={h1}")
-
-    chal_1 = _parse_www_auth(www_auth_1)
-    nonce_a = chal_1.get("nonce", "")
-    realm   = chal_1.get("realm", "Protected Area")
-    _LOGGER.debug("[TYDOM] nonce_A=%s  realm=%r", nonce_a, realm)
-
-    # ---- Requête 2 : nouvelle connexion + Digest(nonce_A) → 401 + nonce_B ----
-    auth_a = _calc_digest(mac, password, realm, nonce_a, uri)
-    _LOGGER.debug("[TYDOM] Req 2 Authorization: %s", auth_a)
-    conn = http.client.HTTPSConnection(host, port, context=ssl_context, timeout=10)
-    conn.request("GET", uri, None, make_ws_headers(auth_a))
-    r2 = conn.getresponse()
-    s2, h2 = r2.status, dict(r2.headers)
-    _LOGGER.debug("[TYDOM] Réponse 2 : status=%d", s2)
-
-    if s2 == 101:
-        _LOGGER.debug("[TYDOM] Connexion acceptée dès req 2 (101)")
-        raw_sock = conn.sock
-        conn.sock = None
-        return raw_sock
-
-    r2.read()
+    conn.request("GET", uri, None, headers)
+    r = conn.getresponse()
+    status = r.status
+    www_auth = r.headers.get("WWW-Authenticate") or r.headers.get("www-authenticate") or ""
+    r.read()
     conn.close()
 
-    if s2 != 401:
-        raise ConnectionError(f"Réponse inattendue req2 : status={s2}, headers={h2}")
+    _LOGGER.debug("[TYDOM] Challenge HTTP : status=%d, WWW-Auth=%s", status, www_auth)
 
-    www_auth_2 = h2.get("WWW-Authenticate") or h2.get("www-authenticate") or ""
-    chal_2  = _parse_www_auth(www_auth_2)
-    nonce_b = chal_2.get("nonce", "")
-    realm   = chal_2.get("realm", realm)
-    _LOGGER.debug("[TYDOM] nonce_B=%s  realm=%r", nonce_b, realm)
-
-    # ---- Requête 3 : nouvelle connexion + Digest(nonce_B) → 101 ----
-    auth_b = _calc_digest(mac, password, realm, nonce_b, uri)
-    _LOGGER.debug("[TYDOM] Req 3 Authorization: %s", auth_b)
-    conn = http.client.HTTPSConnection(host, port, context=ssl_context, timeout=10)
-    conn.request("GET", uri, None, make_ws_headers(auth_b))
-    r3 = conn.getresponse()
-    s3, h3 = r3.status, dict(r3.headers)
-    body3 = r3.read()
-    www_auth_3 = h3.get("WWW-Authenticate") or h3.get("www-authenticate") or ""
-    _LOGGER.debug("[TYDOM] Réponse 3 : status=%d, WWW-Auth=%s", s3, www_auth_3)
-    _LOGGER.debug("[TYDOM] Réponse 3 headers complets : %s", h3)
-
-    # Log de vérification du calcul Digest
-    import hashlib as _hlib
-    _ha1 = _hlib.md5(f"{mac}:{realm}:{password}".encode()).hexdigest()
-    _ha2 = _hlib.md5(f"GET:{uri}".encode()).hexdigest()
-    _LOGGER.debug("[TYDOM] Vérif calcul — mac=%r password=%r realm=%r", mac, password, realm)
-    _LOGGER.debug("[TYDOM] ha1=%s  ha2=%s", _ha1, _ha2)
-
-    if s3 != 101:
-        conn.close()
-        raise PermissionError(
-            f"Échec après 3 tentatives (status={s3}). "
-            f"WWW-Auth reçu: {www_auth_3!r}. "
-            f"Calcul: mac={mac!r}, realm={realm!r}, password_len={len(password)}. "
-            f"Body={body3[:200]!r}"
+    if not www_auth:
+        raise ConnectionError(
+            f"Pas de challenge Digest reçu (status={status}). "
+            f"Vérifiez l'adresse IP et la MAC."
         )
 
-    raw_sock = conn.sock
-    conn.sock = None
-    return raw_sock
+    chal  = _parse_www_auth(www_auth)
+    nonce = chal.get("nonce", "")
+    realm = chal.get("realm", "Protected Area")
+    return realm, nonce
 
 
 # ---------------------------------------------------------------------------
@@ -256,39 +183,46 @@ class TydomClient:
         return ctx
 
     async def connect(self) -> bool:
-        """Handshake 3 requêtes + WebSocket, non-bloquant pour HA."""
+        """Connexion en 2 étapes : challenge HTTP puis websockets.connect()."""
         _LOGGER.info("Connexion Tydom (%s)…", self._host)
         ssl_context = self._build_ssl_context()
         loop = asyncio.get_event_loop()
 
+        # Étape 1 — récupérer le challenge Digest (executor, non-bloquant)
         try:
-            raw_sock = await loop.run_in_executor(
-                None, _do_full_handshake_sync,
-                self._host, TYDOM_PORT, self._mac, self._password, ssl_context,
+            realm, nonce = await loop.run_in_executor(
+                None, _get_digest_challenge_sync,
+                self._host, TYDOM_PORT, self._mac, ssl_context,
             )
-        except PermissionError as exc:
-            _LOGGER.error("%s", exc)
-            return False
         except Exception as exc:
-            _LOGGER.error("Impossible de contacter la box Tydom : %s", exc)
+            _LOGGER.error("Impossible d'obtenir le challenge Tydom : %s", exc)
             return False
 
-        ws_uri = f"wss://{self._host}:{TYDOM_PORT}{MEDIATION_URI.format(mac=self._mac)}"
+        _LOGGER.debug("[TYDOM] realm=%r  nonce=%s", realm, nonce)
+
+        # Étape 2 — calculer l'Authorization et ouvrir le WebSocket
+        uri = MEDIATION_URI.format(mac=self._mac)
+        authorization = _calc_digest(self._mac, self._password, realm, nonce, uri)
+        _LOGGER.debug("[TYDOM] Authorization: %s", authorization)
+
+        ws_uri = f"wss://{self._host}:{TYDOM_PORT}{uri}"
+
+        ws_kwargs: dict = {
+            "ssl": ssl_context,
+            "ping_interval": 30,
+            "ping_timeout": 10,
+            "close_timeout": 5,
+        }
+        auth_header = {"Authorization": authorization}
+        if "additional_headers" in inspect.signature(websockets.connect).parameters:
+            ws_kwargs["additional_headers"] = auth_header
+        else:
+            ws_kwargs["extra_headers"] = auth_header
+
         try:
-            self._websocket = await websockets.connect(
-                ws_uri,
-                sock=raw_sock,
-                ssl=None,
-                ping_interval=30,
-                ping_timeout=10,
-                close_timeout=5,
-            )
+            self._websocket = await websockets.connect(ws_uri, **ws_kwargs)
         except Exception as exc:
-            _LOGGER.error("Impossible d'initialiser le WebSocket : %s", exc)
-            try:
-                raw_sock.close()
-            except Exception:
-                pass
+            _LOGGER.error("Impossible d'ouvrir le WebSocket Tydom : %s", exc)
             return False
 
         self._connected = True
