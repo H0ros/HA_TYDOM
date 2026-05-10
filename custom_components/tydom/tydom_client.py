@@ -98,7 +98,7 @@ def _calc_digest(mac: str, password: str, realm: str, nonce: str, uri: str, opaq
     ha1      = hashlib.md5(f"{mac}:{realm}:{password}".encode()).hexdigest()
     ha2      = hashlib.md5(f"GET:{uri}".encode()).hexdigest()
     nc       = "00000001"
-    cnonce   = hashlib.md5(b"tydom_ha").hexdigest()[:8]
+    cnonce   = base64.b64encode(os.urandom(8)).decode("ascii")
     response = hashlib.md5(f"{ha1}:{nonce}:{nc}:{cnonce}:auth:{ha2}".encode()).hexdigest()
     header = (
         f'Digest username="{mac}", realm="{realm}", '
