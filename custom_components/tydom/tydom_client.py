@@ -1,14 +1,12 @@
 """Client WebSocket pour la box Tydom de Delta Dore.
 
-Flow de connexion (identique à tydom2mqtt) :
-  1. Requête HTTP simple → 401 + WWW-Authenticate: Digest (nonce_A)
-  2. Calcul Authorization Digest avec nonce_A
-  3. websockets.connect() avec Authorization dans les headers → 101 ✓
+Flow de connexion :
+  1. Requête HTTP avec headers WebSocket (Upgrade) → 401 + nonce
+  2. Calcul Authorization Digest avec ce nonce
+  3. websockets.connect() avec Authorization → 101 ✓
 
-Le nonce reste valide entre l'étape 1 et 3 car la box ne le lie pas
-à la connexion TCP, contrairement à ce qu'on croyait.
-Le vrai problème précédent était l'utilisation de sock=raw_sock qui
-perturbait le handshake WebSocket de la librairie websockets.
+Le nonce doit être obtenu avec les headers WebSocket (Upgrade/Connection)
+sinon la box génère un nonce différent pour les connexions WebSocket.
 """
 from __future__ import annotations
 
@@ -34,7 +32,7 @@ TYDOM_REMOTE_HOST = "mediation.tydom.com"
 
 
 # ---------------------------------------------------------------------------
-# Helpers parsing réponses WebSocket encapsulées
+# Helpers parsing
 # ---------------------------------------------------------------------------
 
 def _parse_chunked_body(raw: str) -> str:
@@ -86,7 +84,7 @@ def _get_uri_origin(raw_bytes: bytes, cmd_prefix: str = "") -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Calcul Digest RFC 2617
+# Digest RFC 2617
 # ---------------------------------------------------------------------------
 
 def _parse_www_auth(www_auth: str) -> dict[str, str]:
@@ -111,42 +109,47 @@ def _calc_digest(mac: str, password: str, realm: str, nonce: str, uri: str) -> s
 
 
 # ---------------------------------------------------------------------------
-# Récupération du nonce (synchrone → executor)
+# Handshake (synchrone → executor)
 # ---------------------------------------------------------------------------
 
-def _get_digest_challenge_sync(
+def _get_challenge_with_ws_headers_sync(
     host: str, port: int, mac: str, ssl_context: ssl.SSLContext
 ) -> tuple[str, str]:
-    """Requête HTTP simple pour obtenir le challenge Digest.
+    """Obtient le nonce Digest en envoyant des headers WebSocket.
 
-    Retourne (realm, nonce).
+    La box génère un nonce lié au contexte WebSocket (headers Upgrade présents).
+    Ce nonce est ensuite valide pour websockets.connect().
     Synchrone — appelé via loop.run_in_executor().
     """
     uri = MEDIATION_URI.format(mac=mac)
-    # Requête HTTP basique sans headers WebSocket, comme tydom2mqtt
     headers = {
         "Host": host,
+        "Connection": "Upgrade",
+        "Upgrade": "websocket",
         "Accept": "*/*",
+        "Sec-WebSocket-Version": "13",
+        "Sec-WebSocket-Key": base64.b64encode(os.urandom(16)).decode("ascii"),
     }
     conn = http.client.HTTPSConnection(host, port, context=ssl_context, timeout=10)
     conn.request("GET", uri, None, headers)
     r = conn.getresponse()
-    status = r.status
+    status   = r.status
     www_auth = r.headers.get("WWW-Authenticate") or r.headers.get("www-authenticate") or ""
     r.read()
     conn.close()
 
-    _LOGGER.debug("[TYDOM] Challenge HTTP : status=%d, WWW-Auth=%s", status, www_auth)
+    _LOGGER.debug("[TYDOM] Challenge : status=%d  WWW-Auth=%s", status, www_auth)
 
     if not www_auth:
         raise ConnectionError(
-            f"Pas de challenge Digest reçu (status={status}). "
-            f"Vérifiez l'adresse IP et la MAC."
+            f"Pas de challenge Digest (status={status}). "
+            "Vérifiez l'adresse IP et la MAC."
         )
 
     chal  = _parse_www_auth(www_auth)
     nonce = chal.get("nonce", "")
     realm = chal.get("realm", "Protected Area")
+    _LOGGER.debug("[TYDOM] realm=%r  nonce=%s", realm, nonce)
     return realm, nonce
 
 
@@ -183,30 +186,27 @@ class TydomClient:
         return ctx
 
     async def connect(self) -> bool:
-        """Connexion en 2 étapes : challenge HTTP puis websockets.connect()."""
+        """Obtient le nonce puis ouvre le WebSocket avec Authorization."""
         _LOGGER.info("Connexion Tydom (%s)…", self._host)
         ssl_context = self._build_ssl_context()
         loop = asyncio.get_event_loop()
 
-        # Étape 1 — récupérer le challenge Digest (executor, non-bloquant)
+        # Étape 1 — nonce via requête avec headers WebSocket (executor)
         try:
             realm, nonce = await loop.run_in_executor(
-                None, _get_digest_challenge_sync,
+                None, _get_challenge_with_ws_headers_sync,
                 self._host, TYDOM_PORT, self._mac, ssl_context,
             )
         except Exception as exc:
             _LOGGER.error("Impossible d'obtenir le challenge Tydom : %s", exc)
             return False
 
-        _LOGGER.debug("[TYDOM] realm=%r  nonce=%s", realm, nonce)
-
-        # Étape 2 — calculer l'Authorization et ouvrir le WebSocket
-        uri = MEDIATION_URI.format(mac=self._mac)
+        # Étape 2 — Authorization Digest + websockets.connect()
+        uri           = MEDIATION_URI.format(mac=self._mac)
         authorization = _calc_digest(self._mac, self._password, realm, nonce, uri)
         _LOGGER.debug("[TYDOM] Authorization: %s", authorization)
 
         ws_uri = f"wss://{self._host}:{TYDOM_PORT}{uri}"
-
         ws_kwargs: dict = {
             "ssl": ssl_context,
             "ping_interval": 30,
