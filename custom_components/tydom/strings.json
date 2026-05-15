@@ -3,23 +3,28 @@
     "step": {
       "user": {
         "title": "Connexion à la box Tydom",
-        "description": "Renseignez l'adresse MAC et le mot de passe de votre box.\n\n**Mot de passe par défaut (Tydom 1)** : les 6 derniers caractères de l'adresse MAC en majuscules.\nExemple : MAC `00:1A:25:08:84:6E` → mot de passe `08846E`",
+        "description": "Entrez l'adresse IP et l'adresse MAC de votre box Tydom, ainsi que les identifiants de votre compte Delta Dore (app mobile) pour récupérer automatiquement le mot de passe.",
         "data": {
           "mac": "Adresse MAC",
-          "password": "Mot de passe",
-          "host": "Adresse IP (optionnel)"
+          "host": "Adresse IP",
+          "deltadore_email": "Email compte Delta Dore",
+          "deltadore_password": "Mot de passe compte Delta Dore",
+          "password": "Mot de passe Tydom (optionnel)"
         },
         "data_description": {
           "mac": "Indiquée sur l'étiquette sous la box — format AA:BB:CC:DD:EE:FF",
-          "password": "Par défaut : 6 derniers caractères de la MAC (sans les ':'), en majuscules",
-          "host": "Laisser vide pour la détection automatique. À renseigner si la détection mDNS échoue."
+          "host": "Adresse IP locale de la box (ex: 192.168.1.47)",
+          "deltadore_email": "Email de l'application Delta Dore / Tydom",
+          "deltadore_password": "Mot de passe de l'application Delta Dore / Tydom",
+          "password": "Laisser vide pour récupération automatique via le compte Delta Dore"
         }
       }
     },
     "error": {
-      "cannot_connect": "Impossible de se connecter. Vérifiez l'adresse IP, l'adresse MAC et le mot de passe.\nMot de passe par défaut = 6 derniers caractères de la MAC en majuscules.",
+      "cannot_connect": "Impossible de se connecter à la box. Vérifiez l'adresse IP, l'adresse MAC et le mot de passe.",
       "invalid_mac": "Adresse MAC invalide. Format attendu : AA:BB:CC:DD:EE:FF",
-      "invalid_password": "Le mot de passe ne peut pas être vide."
+      "missing_credentials": "Renseignez soit les identifiants Delta Dore, soit le mot de passe Tydom.",
+      "cannot_connect_cloud": "Impossible de récupérer le mot de passe via le compte Delta Dore. Vérifiez vos identifiants."
     },
     "abort": {
       "already_configured": "Cette box Tydom est déjà configurée."
