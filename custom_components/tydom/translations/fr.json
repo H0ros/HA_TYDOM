@@ -3,29 +3,28 @@
     "step": {
       "user": {
         "title": "Connexion à la box Tydom",
-        "description": "Renseignez l'adresse MAC et **l'une** des deux options d'authentification :\n- **Code PIN** : le code imprimé sur l'étiquette sous la box (Tydom 1.0 : 6 chiffres)\n- **Compte Delta Dore** : email + mot de passe de l'application Delta Dore",
+        "description": "Entrez l'adresse IP et l'adresse MAC de votre box Tydom, ainsi que les identifiants de votre compte Delta Dore (app mobile) pour récupérer automatiquement le mot de passe.",
         "data": {
-          "mac": "Adresse MAC de la box",
-          "host": "Adresse IP (optionnel)",
-          "password": "Code PIN de l'étiquette",
-          "deltadore_email": "Email du compte Delta Dore (optionnel)",
-          "deltadore_password": "Mot de passe du compte Delta Dore (optionnel)"
+          "mac": "Adresse MAC",
+          "host": "Adresse IP",
+          "deltadore_email": "Email compte Delta Dore",
+          "deltadore_password": "Mot de passe compte Delta Dore",
+          "password": "Mot de passe Tydom (optionnel)"
         },
         "data_description": {
-          "mac": "Format : AA:BB:CC:DD:EE:FF — indiqué sur l'étiquette sous la box",
-          "host": "Laisser vide pour la détection automatique (mDNS). Remplir si la détection échoue.",
-          "password": "Code à 6 chiffres sur l'étiquette. Laisser vide si vous utilisez le compte Delta Dore.",
-          "deltadore_email": "Identifiant de l'app Delta Dore. Utilisé si le PIN est absent ou ne fonctionne plus.",
-          "deltadore_password": "Mot de passe de l'app Delta Dore."
+          "mac": "Indiquée sur l'étiquette sous la box — format AA:BB:CC:DD:EE:FF",
+          "host": "Adresse IP locale de la box (ex: 192.168.1.47)",
+          "deltadore_email": "Email de l'application Delta Dore / Tydom",
+          "deltadore_password": "Mot de passe de l'application Delta Dore / Tydom",
+          "password": "Laisser vide pour récupération automatique via le compte Delta Dore"
         }
       }
     },
     "error": {
-      "cannot_connect": "Impossible de se connecter à la box. Vérifiez l'adresse MAC, le code PIN et l'adresse IP.",
+      "cannot_connect": "Impossible de se connecter à la box. Vérifiez l'adresse IP, l'adresse MAC et le mot de passe.",
       "invalid_mac": "Adresse MAC invalide. Format attendu : AA:BB:CC:DD:EE:FF",
-      "missing_credentials": "Renseignez soit le Code PIN, soit les identifiants du compte Delta Dore.",
-      "cloud_password_not_found": "Connexion Delta Dore réussie mais mot de passe Tydom introuvable dans le compte.",
-      "cannot_connect_cloud": "Impossible de joindre l'API Delta Dore. Vérifiez vos identifiants et votre connexion internet."
+      "missing_credentials": "Renseignez soit les identifiants Delta Dore, soit le mot de passe Tydom.",
+      "cannot_connect_cloud": "Impossible de récupérer le mot de passe via le compte Delta Dore. Vérifiez vos identifiants."
     },
     "abort": {
       "already_configured": "Cette box Tydom est déjà configurée."
