@@ -70,7 +70,7 @@ class TydomCoordinator(DataUpdateCoordinator[dict[str, TydomDevice]]):
         self._entry = entry
         mac: str = entry.data[CONF_MAC]
         password: str = entry.data[CONF_PASSWORD]
-        host: str | None = entry.data.get(CONF_HOST) or None
+        host: str = entry.data.get(CONF_HOST) or f"{mac}-tydom.local"
 
         self.client = TydomClient(
             mac=mac,
