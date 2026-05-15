@@ -3,29 +3,28 @@
     "step": {
       "user": {
         "title": "Connect to Tydom hub",
-        "description": "Enter the MAC address and **one** of the two authentication options:\n- **PIN code**: the code printed on the sticker on the bottom of the hub\n- **Delta Dore account**: email + password from the Delta Dore mobile app",
+        "description": "Enter the IP address and MAC address of your Tydom hub, along with your Delta Dore account credentials to automatically retrieve the password.",
         "data": {
-          "mac": "Hub MAC address",
-          "host": "IP address (optional)",
-          "password": "PIN code from sticker",
-          "deltadore_email": "Delta Dore account email (optional)",
-          "deltadore_password": "Delta Dore account password (optional)"
+          "mac": "MAC Address",
+          "host": "IP Address",
+          "deltadore_email": "Delta Dore account email",
+          "deltadore_password": "Delta Dore account password",
+          "password": "Tydom password (optional)"
         },
         "data_description": {
-          "mac": "Format: AA:BB:CC:DD:EE:FF — found on the sticker on the bottom of the hub",
-          "host": "Leave empty for automatic mDNS discovery. Fill in if auto-discovery fails.",
-          "password": "6-digit code on the sticker. Leave empty if using Delta Dore account credentials.",
-          "deltadore_email": "Delta Dore app login. Used if PIN is missing or no longer works.",
-          "deltadore_password": "Delta Dore app password."
+          "mac": "Found on the sticker on the bottom of the hub — format AA:BB:CC:DD:EE:FF",
+          "host": "Local IP address of the hub (e.g. 192.168.1.47)",
+          "deltadore_email": "Email of the Delta Dore / Tydom app",
+          "deltadore_password": "Password of the Delta Dore / Tydom app",
+          "password": "Leave empty for automatic retrieval via Delta Dore account"
         }
       }
     },
     "error": {
-      "cannot_connect": "Cannot connect to the hub. Check your MAC address, PIN code and IP address.",
+      "cannot_connect": "Cannot connect to the hub. Check IP address, MAC address and password.",
       "invalid_mac": "Invalid MAC address. Expected format: AA:BB:CC:DD:EE:FF",
-      "missing_credentials": "Please provide either the PIN code or Delta Dore account credentials.",
-      "cloud_password_not_found": "Delta Dore login succeeded but Tydom password was not found in the account.",
-      "cannot_connect_cloud": "Cannot reach Delta Dore API. Check your credentials and internet connection."
+      "missing_credentials": "Provide either Delta Dore credentials or the Tydom password.",
+      "cannot_connect_cloud": "Cannot retrieve password via Delta Dore account. Check your credentials."
     },
     "abort": {
       "already_configured": "This Tydom hub is already configured."
