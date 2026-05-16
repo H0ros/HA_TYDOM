@@ -187,32 +187,29 @@ def _build_ssl_context() -> ssl.SSLContext:
     """Contexte SSL compatible avec le firmware TLS de la Tydom 1.0.
 
     Python 3.14 / OpenSSL 3.x désactive le legacy renegotiation par défaut.
-    On crée un fichier openssl.cnf temporaire qui le réactive.
+    On crée un fichier openssl.cnf temporaire AVANT d'initialiser le SSLContext
+    car OPENSSL_CONF est lu au moment de la création du contexte.
     """
-    import os
     import tempfile
 
-    # Créer un fichier openssl.cnf temporaire qui autorise le legacy renegotiation
-    openssl_conf = """
-openssl_conf = openssl_init
+    openssl_conf = (
+        "openssl_conf = openssl_init\n\n"
+        "[openssl_init]\n"
+        "ssl_conf = ssl_sect\n\n"
+        "[ssl_sect]\n"
+        "system_default = system_default_sect\n\n"
+        "[system_default_sect]\n"
+        "Options = UnsafeLegacyRenegotiation\n"
+        "MinProtocol = TLSv1\n"
+        "CipherString = DEFAULT:@SECLEVEL=1\n"
+    )
 
-[openssl_init]
-ssl_conf = ssl_sect
-
-[ssl_sect]
-system_default = system_default_sect
-
-[system_default_sect]
-Options = UnsafeLegacyRenegotiation
-MinProtocol = TLSv1
-CipherString = DEFAULT:@SECLEVEL=1
-"""
+    # Écrire le fichier de config
     tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".cnf", delete=False)
     tmp.write(openssl_conf)
     tmp.flush()
     tmp.close()
 
-    # Pointer OpenSSL vers notre config temporaire
     old_conf = os.environ.get("OPENSSL_CONF")
     os.environ["OPENSSL_CONF"] = tmp.name
 
@@ -220,14 +217,13 @@ CipherString = DEFAULT:@SECLEVEL=1
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
         ctx.verify_mode    = ssl.CERT_NONE
-        ctx.options |= getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0x4)
-        ctx.options |= 0x4
+        ctx.options       |= getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0x4)
+        ctx.options       |= 0x4
         try:
             ctx.set_ciphers("DEFAULT:@SECLEVEL=1")
         except ssl.SSLError:
             pass
     finally:
-        # Restaurer la variable d'environnement
         if old_conf is None:
             os.environ.pop("OPENSSL_CONF", None)
         else:
@@ -439,11 +435,17 @@ class TydomClient:
             timeout=timeout,
         )
 
-    async def _request(self, frame: bytes) -> dict | list | None:
+    async def _request(self, frame: bytes, timeout: float = 20.0) -> dict | list | None:
         await self._send(frame)
         accumulated = b""
+        deadline = asyncio.get_event_loop().time() + timeout
         while True:
-            opcode, payload = await self._recv(timeout=15.0)
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                _LOGGER.warning("Timeout en attendant la réponse Tydom")
+                return None
+
+            opcode, payload = await self._recv(timeout=min(remaining, 10.0))
             if opcode == 0x9:  # PING
                 await self._send(_ws_pong_frame(payload))
                 continue
@@ -452,21 +454,27 @@ class TydomClient:
                 return None
 
             accumulated += payload
+            _LOGGER.debug(
+                "[TYDOM] Frame reçue opcode=0x%x len=%d total=%d",
+                opcode, len(payload), len(accumulated)
+            )
 
-            # Tenter de parser — si incomplet, continuer à accumuler
+            # Tenter de parser le JSON
             result = _extract_json(accumulated)
             if result is not None:
                 return result
 
-            # Vérifier si la réponse HTTP est complète (fin du chunked encoding)
+            # Vérifier si la réponse chunked est terminée (chunk final = "0\r\n\r\n")
             raw = accumulated.decode("utf-8", errors="replace")
-            if "0\r\n\r\n" in raw or (
-                "\r\n\r\n" in raw
-                and "transfer-encoding: chunked" not in raw.lower()
-            ):
-                # Réponse non-chunked ou chunked terminée mais JSON invalide
-                _LOGGER.debug("Réponse incomplète ou non-JSON : %s", raw[:200])
+            if "\r\n0\r\n\r\n" in raw or raw.rstrip().endswith("0\r\n"):
+                _LOGGER.debug("[TYDOM] Fin chunked détectée, payload brut : %s", raw[:500])
                 return None
+
+            # Si pas chunked et on a les headers + body, c'est fini
+            if "\r\n\r\n" in raw and "transfer-encoding: chunked" not in raw.lower():
+                _LOGGER.debug("[TYDOM] Réponse non-chunked complète, payload brut : %s", raw[:500])
+                result = _extract_json(accumulated)
+                return result
 
     # ------------------------------------------------------------------
     # Requêtes de haut niveau
