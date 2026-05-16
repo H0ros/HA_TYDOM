@@ -87,22 +87,22 @@ class TydomCoordinator(DataUpdateCoordinator[dict[str, TydomDevice]]):
     # ------------------------------------------------------------------
 
     async def async_connect(self) -> bool:
-        """Ouvre la connexion WebSocket et charge les devices."""
+        """Charge les devices initiaux.
+        
+        La box Tydom ferme la connexion TLS après chaque échange.
+        On connecte, charge, déconnecte — puis le polling prend le relais.
+        """
         if not await self.client.connect():
             return False
 
-        self._connected = True
-
-        # Chargement initial des devices
         try:
             await self._load_devices()
         except Exception as exc:
-            _LOGGER.error("Erreur lors du chargement initial des devices : %s", exc)
-            # Ne bloque pas l'intégration — on continuera en polling
+            _LOGGER.error("Erreur chargement initial des devices : %s", exc)
+        finally:
+            await self.client.disconnect()
 
-        # Démarrage de l'écoute push
-        self.client.start_listening()
-
+        self._connected = True
         return True
 
     async def async_disconnect(self) -> None:
@@ -191,17 +191,23 @@ class TydomCoordinator(DataUpdateCoordinator[dict[str, TydomDevice]]):
     # ------------------------------------------------------------------
 
     async def _async_update_data(self) -> dict[str, TydomDevice]:
-        """Mise à jour périodique — polling de /devices/data."""
-        if not self.client.is_connected:
-            _LOGGER.warning("Client Tydom déconnecté, tentative de reconnexion…")
-            if not await self.client.connect():
-                raise UpdateFailed("Impossible de se reconnecter à la box Tydom")
-            self.client.start_listening()
+        """Mise à jour périodique — reconnexion + polling de /devices/data.
+
+        La box Tydom ferme la connexion TLS après chaque échange.
+        On reconnecte à chaque mise à jour.
+        """
+        if self.client.is_connected:
+            await self.client.disconnect()
+
+        if not await self.client.connect():
+            raise UpdateFailed("Impossible de se connecter à la box Tydom")
 
         try:
             devices_data = await self.client.get_devices_data()
         except Exception as exc:
             raise UpdateFailed(f"Erreur lors de /devices/data : {exc}") from exc
+        finally:
+            await self.client.disconnect()
 
         if devices_data:
             for device_block in devices_data:
