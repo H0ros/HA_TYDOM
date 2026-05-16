@@ -441,15 +441,32 @@ class TydomClient:
 
     async def _request(self, frame: bytes) -> dict | list | None:
         await self._send(frame)
+        accumulated = b""
         while True:
-            opcode, payload = await self._recv()
+            opcode, payload = await self._recv(timeout=15.0)
             if opcode == 0x9:  # PING
                 await self._send(_ws_pong_frame(payload))
                 continue
             if opcode == 0x8:  # CLOSE
                 self._connected = False
                 return None
-            return _extract_json(payload)
+
+            accumulated += payload
+
+            # Tenter de parser — si incomplet, continuer à accumuler
+            result = _extract_json(accumulated)
+            if result is not None:
+                return result
+
+            # Vérifier si la réponse HTTP est complète (fin du chunked encoding)
+            raw = accumulated.decode("utf-8", errors="replace")
+            if "0\r\n\r\n" in raw or (
+                "\r\n\r\n" in raw
+                and "transfer-encoding: chunked" not in raw.lower()
+            ):
+                # Réponse non-chunked ou chunked terminée mais JSON invalide
+                _LOGGER.debug("Réponse incomplète ou non-JSON : %s", raw[:200])
+                return None
 
     # ------------------------------------------------------------------
     # Requêtes de haut niveau
