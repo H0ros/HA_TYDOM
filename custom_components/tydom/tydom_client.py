@@ -77,21 +77,47 @@ def _sock_recv_exact(sock: ssl.SSLSocket, n: int) -> bytes:
     return buf
 
 
-def _sock_recv_frame(sock: ssl.SSLSocket) -> tuple[int, bytes]:
-    """Lit une frame WebSocket complète (bloquant). Retourne (opcode, payload)."""
-    header = _sock_recv_exact(sock, 2)
-    opcode      = header[0] & 0x0F
-    payload_len = header[1] & 0x7F
+def _sock_recv_message(sock: ssl.SSLSocket) -> tuple[int, bytes]:
+    """Lit un message WebSocket complet en assemblant les frames de continuation.
+    
+    RFC 6455 : un message peut être fragmenté en plusieurs frames :
+    - Frame initiale : FIN=0, opcode=0x1/0x2
+    - Frames de continuation : FIN=0, opcode=0x0
+    - Frame finale : FIN=1, opcode=0x0
+    """
+    full_payload = b""
+    final_opcode = 0x2  # BINARY par défaut
 
-    if payload_len == 126:
-        ext         = _sock_recv_exact(sock, 2)
-        payload_len = struct.unpack("!H", ext)[0]
-    elif payload_len == 127:
-        ext         = _sock_recv_exact(sock, 8)
-        payload_len = struct.unpack("!Q", ext)[0]
+    while True:
+        header = _sock_recv_exact(sock, 2)
+        fin     = (header[0] & 0x80) != 0
+        opcode  = header[0] & 0x0F
+        masked  = (header[1] & 0x80) != 0
+        payload_len = header[1] & 0x7F
 
-    payload = _sock_recv_exact(sock, payload_len)
-    return opcode, payload
+        if payload_len == 126:
+            ext         = _sock_recv_exact(sock, 2)
+            payload_len = struct.unpack("!H", ext)[0]
+        elif payload_len == 127:
+            ext         = _sock_recv_exact(sock, 8)
+            payload_len = struct.unpack("!Q", ext)[0]
+
+        if masked:
+            mask    = _sock_recv_exact(sock, 4)
+            payload = _sock_recv_exact(sock, payload_len)
+            payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        else:
+            payload = _sock_recv_exact(sock, payload_len)
+
+        # Mémoriser l'opcode de la première frame
+        if opcode != 0x0:
+            final_opcode = opcode
+
+        full_payload += payload
+
+        # FIN=1 → message complet
+        if fin:
+            return final_opcode, full_payload
 
 
 def _sock_send_frame(sock: ssl.SSLSocket, frame: bytes) -> None:
@@ -431,50 +457,23 @@ class TydomClient:
             raise ConnectionError("Non connecté")
         loop = asyncio.get_event_loop()
         return await asyncio.wait_for(
-            loop.run_in_executor(None, _sock_recv_frame, self._sock),
+            loop.run_in_executor(None, _sock_recv_message, self._sock),
             timeout=timeout,
         )
 
     async def _request(self, frame: bytes, timeout: float = 20.0) -> dict | list | None:
         await self._send(frame)
-        accumulated = b""
-        deadline = asyncio.get_event_loop().time() + timeout
         while True:
-            remaining = deadline - asyncio.get_event_loop().time()
-            if remaining <= 0:
-                _LOGGER.warning("Timeout en attendant la réponse Tydom")
-                return None
-
-            opcode, payload = await self._recv(timeout=min(remaining, 10.0))
+            opcode, payload = await self._recv(timeout=timeout)
             if opcode == 0x9:  # PING
                 await self._send(_ws_pong_frame(payload))
                 continue
             if opcode == 0x8:  # CLOSE
                 self._connected = False
                 return None
-
-            accumulated += payload
-            _LOGGER.debug(
-                "[TYDOM] Frame reçue opcode=0x%x len=%d total=%d",
-                opcode, len(payload), len(accumulated)
-            )
-
-            # Tenter de parser le JSON
-            result = _extract_json(accumulated)
-            if result is not None:
-                return result
-
-            # Vérifier si la réponse chunked est terminée (chunk final = "0\r\n\r\n")
-            raw = accumulated.decode("utf-8", errors="replace")
-            if "\r\n0\r\n\r\n" in raw or raw.rstrip().endswith("0\r\n"):
-                _LOGGER.debug("[TYDOM] Fin chunked détectée, payload brut : %s", raw[:500])
-                return None
-
-            # Si pas chunked et on a les headers + body, c'est fini
-            if "\r\n\r\n" in raw and "transfer-encoding: chunked" not in raw.lower():
-                _LOGGER.debug("[TYDOM] Réponse non-chunked complète, payload brut : %s", raw[:500])
-                result = _extract_json(accumulated)
-                return result
+            # _sock_recv_message a déjà assemblé toutes les frames de continuation
+            _LOGGER.debug("[TYDOM] Message reçu opcode=0x%x len=%d", opcode, len(payload))
+            return _extract_json(payload)
 
     # ------------------------------------------------------------------
     # Requêtes de haut niveau
@@ -509,7 +508,7 @@ class TydomClient:
         while self._connected:
             try:
                 opcode, payload = await asyncio.wait_for(
-                    loop.run_in_executor(None, _sock_recv_frame, self._sock),
+                    loop.run_in_executor(None, _sock_recv_message, self._sock),
                     timeout=60,
                 )
                 if opcode == 0x9:  # PING
