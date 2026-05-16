@@ -1,57 +1,115 @@
 """Client WebSocket pour la box Tydom de Delta Dore.
 
-Protocole local (Tydom 1.0) :
-1. Handshake HTTPS vers la box dans un thread executor (opération bloquante)
-   → récupère le challenge WWW-Authenticate: Digest
-2. Calcul de la réponse Digest via requests.auth.HTTPDigestAuth
-3. Ouverture du WebSocket asyncio avec l'en-tête Authorization calculé
-4. Envoi de requêtes HTTP/1.1 encapsulées dans le WebSocket
-5. Réception et parsing des réponses HTTP/1.1 chunked encapsulées
+Protocole de connexion (validé empiriquement) :
+  1. Connexion TLS 1 → GET avec headers WebSocket → 401 + nonce
+  2. Connexion TLS 2 → GET avec Authorization Digest(nonce) → 101 Switching Protocols
+  3. Lecture/écriture directe sur le SSLSocket via run_in_executor (pas de asyncio streams)
+  4. Framing WebSocket manuel (RFC 6455)
 
-Mode cloud (optionnel) :
-- Récupération du mot de passe Tydom depuis l'API Delta Dore avec les identifiants
-  du compte Delta Dore (email + mot de passe de l'app)
-- Utile si le PIN de l'étiquette a été changé via l'application Delta Dore
+Points clés :
+- Mot de passe récupéré depuis l'API Delta Dore (pas le PIN étiquette)
+- realm en minuscules pour le calcul Digest
+- cnonce en hexadécimal
+- qop="auth" avec guillemets
+- ssl.SSLContext(PROTOCOL_TLS_CLIENT) + SECLEVEL=1 pour OpenSSL 3.x
 """
 from __future__ import annotations
 
 import asyncio
 import base64
-import http.client
+import hashlib
 import json
 import logging
 import os
+import re
+import socket
 import ssl
-from io import BytesIO
+import struct
 from typing import Any, Callable
-
-import websockets
-from requests.auth import HTTPDigestAuth
 
 _LOGGER = logging.getLogger(__name__)
 
-TYDOM_PORT = 443
+TYDOM_PORT    = 443
 MEDIATION_URI = "/mediation/client?mac={mac}&appli=1"
-TYDOM_REMOTE_HOST = "mediation.tydom.com"
-
-# API Delta Dore pour récupérer le mot de passe Tydom
-DELTADORE_AUTH_URL = "https://homepilot-api.somfy.com/auth/sign_in"
-DELTADORE_TYDOM_URL = "https://homepilot-api.somfy.com/account"
 
 
 # ---------------------------------------------------------------------------
-# Helpers de parsing des réponses HTTP/1.1 encapsulées dans le WebSocket
+# WebSocket framing manuel (RFC 6455)
+# ---------------------------------------------------------------------------
+
+def _ws_encode(payload: bytes) -> bytes:
+    """Encode une frame WebSocket client BINARY masquée."""
+    mask   = os.urandom(4)
+    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    length = len(payload)
+    if length < 126:
+        header = struct.pack("!BB", 0x82, 0x80 | length)
+    elif length < 65536:
+        header = struct.pack("!BBH", 0x82, 0xFE, length)
+    else:
+        header = struct.pack("!BBQ", 0x82, 0xFF, length)
+    return header + mask + masked
+
+
+def _ws_ping_frame() -> bytes:
+    mask = os.urandom(4)
+    return struct.pack("!BB", 0x89, 0x80) + mask
+
+
+def _ws_pong_frame(payload: bytes = b"") -> bytes:
+    mask   = os.urandom(4)
+    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    return struct.pack("!BB", 0x8A, 0x80 | len(payload)) + mask + masked
+
+
+# ---------------------------------------------------------------------------
+# Lecture bloquante sur SSLSocket (pour executor)
+# ---------------------------------------------------------------------------
+
+def _sock_recv_exact(sock: ssl.SSLSocket, n: int) -> bytes:
+    """Lit exactement n octets depuis le socket (bloquant)."""
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("Connexion fermée par la box Tydom")
+        buf += chunk
+    return buf
+
+
+def _sock_recv_frame(sock: ssl.SSLSocket) -> tuple[int, bytes]:
+    """Lit une frame WebSocket complète (bloquant). Retourne (opcode, payload)."""
+    header = _sock_recv_exact(sock, 2)
+    opcode      = header[0] & 0x0F
+    payload_len = header[1] & 0x7F
+
+    if payload_len == 126:
+        ext         = _sock_recv_exact(sock, 2)
+        payload_len = struct.unpack("!H", ext)[0]
+    elif payload_len == 127:
+        ext         = _sock_recv_exact(sock, 8)
+        payload_len = struct.unpack("!Q", ext)[0]
+
+    payload = _sock_recv_exact(sock, payload_len)
+    return opcode, payload
+
+
+def _sock_send_frame(sock: ssl.SSLSocket, frame: bytes) -> None:
+    """Envoie une frame WebSocket (bloquant)."""
+    sock.sendall(frame)
+
+
+# ---------------------------------------------------------------------------
+# Helpers de parsing des réponses HTTP encapsulées
 # ---------------------------------------------------------------------------
 
 def _parse_chunked_body(raw: str) -> str:
-    """Décode un body HTTP/1.1 Transfer-Encoding: chunked."""
     output = []
-    lines = raw.split("\r\n")
+    lines  = raw.split("\r\n")
     i = 0
     while i < len(lines):
-        line = lines[i]
         try:
-            chunk_size = int(line, 16)
+            chunk_size = int(lines[i], 16)
         except ValueError:
             i += 1
             continue
@@ -63,38 +121,28 @@ def _parse_chunked_body(raw: str) -> str:
     return "".join(output)
 
 
-def _extract_json_from_response(raw_bytes: bytes, cmd_prefix: str = "") -> dict | list | None:
-    """Extrait et parse le JSON d'une réponse HTTP Tydom encapsulée."""
+def _extract_json(raw_bytes: bytes) -> dict | list | None:
     try:
-        raw = raw_bytes[len(cmd_prefix):].decode("utf-8", errors="replace")
-
+        raw = raw_bytes.decode("utf-8", errors="replace")
         if "\r\n\r\n" not in raw:
             return None
-
         headers_part, body_part = raw.split("\r\n\r\n", 1)
-
-        first_line = headers_part.split("\r\n")[0]
-        if not first_line.startswith("HTTP/"):
+        if not headers_part.split("\r\n")[0].startswith("HTTP/"):
             return None
-
         if "transfer-encoding: chunked" in headers_part.lower():
             body_part = _parse_chunked_body(body_part)
-
         body_part = body_part.strip()
         if not body_part:
             return None
-
         return json.loads(body_part)
-
     except Exception as exc:
         _LOGGER.debug("Parsing réponse Tydom échoué : %s", exc)
         return None
 
 
-def _get_uri_origin(raw_bytes: bytes, cmd_prefix: str = "") -> str | None:
-    """Extrait le header Uri-Origin d'une réponse HTTP Tydom."""
+def _get_uri_origin(raw_bytes: bytes) -> str | None:
     try:
-        raw = raw_bytes[len(cmd_prefix):].decode("utf-8", errors="replace")
+        raw = raw_bytes.decode("utf-8", errors="replace")
         for line in raw.split("\r\n"):
             if line.lower().startswith("uri-origin:"):
                 return line.split(":", 1)[1].strip()
@@ -104,106 +152,183 @@ def _get_uri_origin(raw_bytes: bytes, cmd_prefix: str = "") -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Récupération du mot de passe via le cloud Delta Dore (optionnel)
+# Calcul Digest RFC 2617
 # ---------------------------------------------------------------------------
 
-def _fetch_tydom_password_from_cloud_sync(
-    email: str, dd_password: str, mac: str
-) -> str | None:
-    """Récupère le mot de passe Tydom depuis l'API Delta Dore (synchrone).
+def _parse_www_auth(www_auth: str) -> dict[str, str]:
+    chal: dict[str, str] = {}
+    for m in re.finditer(r'(\w+)=(?:"([^"]*)"|([\w./+=-]+))', www_auth):
+        chal[m.group(1)] = m.group(2) if m.group(2) is not None else m.group(3)
+    return chal
 
-    Cette fonction est destinée à être appelée dans un executor thread.
+
+def _calc_digest(mac: str, password: str, nonce: str, realm: str,
+                 opaque: str, uri: str) -> str:
+    realm_lower = realm.lower()
+    ha1      = hashlib.md5(f"{mac}:{realm_lower}:{password}".encode()).hexdigest()
+    ha2      = hashlib.md5(f"GET:{uri}".encode()).hexdigest()
+    nc, cnonce = "00000001", os.urandom(8).hex()
+    response = hashlib.md5(f"{ha1}:{nonce}:{nc}:{cnonce}:auth:{ha2}".encode()).hexdigest()
+    auth = (
+        f'Digest username="{mac}", realm="{realm_lower}", '
+        f'nonce="{nonce}", uri="{uri}", '
+        f'response="{response}", qop="auth", nc={nc}, cnonce="{cnonce}"'
+    )
+    if opaque:
+        auth += f', opaque="{opaque}"'
+    return auth
+
+
+# ---------------------------------------------------------------------------
+# SSL context
+# ---------------------------------------------------------------------------
+
+def _build_ssl_context() -> ssl.SSLContext:
+    """Contexte SSL compatible avec le firmware TLS de la Tydom 1.0.
+
+    Python 3.14 / OpenSSL 3.x désactive le legacy renegotiation par défaut.
+    On crée un fichier openssl.cnf temporaire qui le réactive.
     """
-    import urllib.request
-    import urllib.error
+    import os
+    import tempfile
 
-    # Étape 1 : authentification Delta Dore
-    auth_payload = json.dumps({"email": email, "password": dd_password}).encode()
-    req = urllib.request.Request(
-        DELTADORE_AUTH_URL,
-        data=auth_payload,
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-        method="POST",
-    )
+    # Créer un fichier openssl.cnf temporaire qui autorise le legacy renegotiation
+    openssl_conf = """
+openssl_conf = openssl_init
+
+[openssl_init]
+ssl_conf = ssl_sect
+
+[ssl_sect]
+system_default = system_default_sect
+
+[system_default_sect]
+Options = UnsafeLegacyRenegotiation
+MinProtocol = TLSv1
+CipherString = DEFAULT:@SECLEVEL=1
+"""
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".cnf", delete=False)
+    tmp.write(openssl_conf)
+    tmp.flush()
+    tmp.close()
+
+    # Pointer OpenSSL vers notre config temporaire
+    old_conf = os.environ.get("OPENSSL_CONF")
+    os.environ["OPENSSL_CONF"] = tmp.name
+
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            auth_data = json.loads(resp.read().decode())
-    except Exception as exc:
-        _LOGGER.error("Authentification Delta Dore échouée : %s", exc)
-        return None
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode    = ssl.CERT_NONE
+        ctx.options |= getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0x4)
+        ctx.options |= 0x4
+        try:
+            ctx.set_ciphers("DEFAULT:@SECLEVEL=1")
+        except ssl.SSLError:
+            pass
+    finally:
+        # Restaurer la variable d'environnement
+        if old_conf is None:
+            os.environ.pop("OPENSSL_CONF", None)
+        else:
+            os.environ["OPENSSL_CONF"] = old_conf
+        try:
+            os.unlink(tmp.name)
+        except Exception:
+            pass
 
-    token = auth_data.get("token") or (auth_data.get("data") or {}).get("token")
-    if not token:
-        _LOGGER.error("Token Delta Dore non trouvé dans la réponse : %s", auth_data)
-        return None
-
-    # Étape 2 : récupération des infos du compte (inclut le mot de passe Tydom)
-    account_req = urllib.request.Request(
-        DELTADORE_TYDOM_URL,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-        },
-        method="GET",
-    )
-    try:
-        with urllib.request.urlopen(account_req, timeout=10) as resp:
-            account_data = json.loads(resp.read().decode())
-    except Exception as exc:
-        _LOGGER.error("Récupération compte Delta Dore échouée : %s", exc)
-        return None
-
-    # Le mot de passe Tydom peut être dans différents champs selon la version de l'API
-    for key in ("tydom_password", "tydomPassword", "password"):
-        pwd = account_data.get(key)
-        if pwd:
-            return str(pwd)
-
-    # Cherche dans les gateways/devices associés
-    for gateway in account_data.get("gateways", []):
-        if mac.upper() in str(gateway.get("mac", "")).upper():
-            for key in ("password", "tydom_password"):
-                pwd = gateway.get(key)
-                if pwd:
-                    return str(pwd)
-
-    _LOGGER.warning(
-        "Mot de passe Tydom non trouvé dans le compte Delta Dore. "
-        "Utilisation du PIN de l'étiquette."
-    )
-    return None
+    return ctx
 
 
 # ---------------------------------------------------------------------------
-# Handshake HTTP (bloquant) — exécuté dans un thread executor
+# Handshake (synchrone → executor)
 # ---------------------------------------------------------------------------
 
-def _do_http_handshake_sync(
-    host: str, port: int, mac: str, password: str, ssl_context: ssl.SSLContext
-) -> str | None:
-    """Effectue le handshake HTTPS et renvoie le header WWW-Authenticate.
+def _open_tls(host: str, port: int, ctx: ssl.SSLContext) -> ssl.SSLSocket:
+    raw = socket.create_connection((host, port), timeout=10)
+    return ctx.wrap_socket(raw, server_hostname=host)
 
-    Fonction synchrone/bloquante — à appeler via loop.run_in_executor().
+
+def _recv_headers(sock: ssl.SSLSocket) -> bytes:
+    resp = b""
+    while b"\r\n\r\n" not in resp:
+        data = sock.recv(4096)
+        if not data:
+            break
+        resp += data
+    try:
+        sock.settimeout(0.3)
+        extra = sock.recv(4096)
+        if extra:
+            resp += extra
+    except Exception:
+        pass
+    sock.settimeout(None)  # Remettre en mode bloquant
+    return resp
+
+
+def _do_handshake_sync(host: str, port: int, mac: str, password: str) -> ssl.SSLSocket:
+    """Effectue le handshake Tydom en 2 connexions TLS.
+    Synchrone — appelé via loop.run_in_executor().
     """
-    uri_path = MEDIATION_URI.format(mac=mac)
-    http_headers = {
-        "Connection": "Upgrade",
-        "Upgrade": "websocket",
-        "Host": f"{host}:{port}",
-        "Accept": "*/*",
-        "Sec-WebSocket-Key": base64.b64encode(os.urandom(16)).decode("ascii"),
-        "Sec-WebSocket-Version": "13",
-    }
-    conn = http.client.HTTPSConnection(host, port, context=ssl_context, timeout=10)
-    conn.request("GET", uri_path, None, http_headers)
-    res = conn.getresponse()
-    www_auth = res.headers.get("WWW-Authenticate", "")
-    res.read()
-    conn.close()
-    return www_auth or None
+    ctx = _build_ssl_context()
+    uri = MEDIATION_URI.format(mac=mac)
+
+    def ws_request(auth: str | None = None) -> bytes:
+        key   = base64.b64encode(os.urandom(16)).decode()
+        lines = [
+            f"GET {uri} HTTP/1.1",
+            f"Host: {host}",
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            f"Sec-WebSocket-Key: {key}",
+            "Sec-WebSocket-Version: 13",
+            "Accept: */*",
+        ]
+        if auth:
+            lines.append(f"Authorization: {auth}")
+        return ("\r\n".join(lines) + "\r\n\r\n").encode()
+
+    # Connexion 1 : challenge
+    sock1 = _open_tls(host, port, ctx)
+    try:
+        sock1.sendall(ws_request())
+        resp1 = _recv_headers(sock1)
+    finally:
+        sock1.close()
+
+    resp1_str = resp1.decode(errors="replace")
+    _LOGGER.debug("[TYDOM] Challenge : %s", resp1_str[:300])
+
+    m = re.search(r'WWW-Authenticate: (.+)\r\n', resp1_str, re.IGNORECASE)
+    if not m:
+        raise ConnectionError(
+            f"Pas de WWW-Authenticate. Réponse : {resp1_str[:200]}"
+        )
+
+    chal   = _parse_www_auth(m.group(1).strip())
+    nonce  = chal.get("nonce", "")
+    realm  = chal.get("realm", "Protected Area")
+    opaque = chal.get("opaque", "")
+    _LOGGER.debug("[TYDOM] realm=%r nonce=%s", realm, nonce[:16])
+
+    auth = _calc_digest(mac, password, nonce, realm, opaque, uri)
+
+    # Connexion 2 : WebSocket
+    sock2 = _open_tls(host, port, ctx)
+    sock2.sendall(ws_request(auth))
+    resp2     = _recv_headers(sock2)
+    resp2_str = resp2.decode(errors="replace")
+    status2   = resp2_str.split(" ")[1].split("\r")[0].strip() if " " in resp2_str else "?"
+    _LOGGER.debug("[TYDOM] Status WebSocket : %s", status2)
+
+    if status2 != "101":
+        sock2.close()
+        raise PermissionError(
+            f"Handshake refusé (status={status2}). Vérifiez le mot de passe Tydom."
+        )
+
+    return sock2
 
 
 # ---------------------------------------------------------------------------
@@ -211,122 +336,55 @@ def _do_http_handshake_sync(
 # ---------------------------------------------------------------------------
 
 class TydomClient:
-    """Client asynchrone pour la box Tydom (mode local, Tydom 1.0)."""
+    """Client asynchrone pour la box Tydom (mode local)."""
 
     def __init__(
         self,
         mac: str,
         password: str,
-        host: str | None = None,
+        host: str,
         *,
         message_callback: Callable[[str, Any], None] | None = None,
     ) -> None:
-        self._mac = mac.upper().replace(":", "").replace("-", "")
+        self._mac      = mac.upper().replace(":", "").replace("-", "")
         self._password = password
-        self._host = host or f"{self._mac}-tydom.local"
+        self._host     = host
         self._message_callback = message_callback
 
-        self._remote = self._host == TYDOM_REMOTE_HOST
-        self._cmd_prefix = "\x02" if self._remote else ""
-
-        self._websocket: websockets.WebSocketClientProtocol | None = None
+        self._sock: ssl.SSLSocket | None = None
         self._listen_task: asyncio.Task | None = None
         self._connected = False
         self._transac_id = 0
+        self._send_lock = asyncio.Lock()
 
-        _LOGGER.debug(
-            "TydomClient initialisé — host=%s, mac=%s, remote=%s",
-            self._host, self._mac, self._remote,
-        )
+        _LOGGER.debug("TydomClient — host=%s, mac=%s", self._host, self._mac)
 
     # ------------------------------------------------------------------
     # Connexion
     # ------------------------------------------------------------------
 
-    def _build_ssl_context(self) -> ssl.SSLContext:
-        """Contexte SSL sans vérification (certificat auto-signé Tydom)."""
-        return ssl._create_unverified_context()
-
-    def _build_digest_header(self, www_auth: str) -> str:
-        """Calcule l'Authorization Digest depuis le challenge WWW-Authenticate."""
-        parts = [p.strip() for p in www_auth.replace("Digest ", "").split(",")]
-        chal: dict[str, str] = {}
-        for part in parts:
-            if "=" in part:
-                k, v = part.split("=", 1)
-                chal[k.strip()] = v.strip().strip('"')
-
-        nonce = chal.get("nonce", "")
-        realm = chal.get("realm", "protected area")
-
-        digest_auth = HTTPDigestAuth(self._mac, self._password)
-        digest_auth._thread_local.chal = {"nonce": nonce, "realm": realm, "qop": "auth"}
-        digest_auth._thread_local.last_nonce = nonce
-        digest_auth._thread_local.nonce_count = 1
-
-        uri = f"https://{self._host}:{TYDOM_PORT}{MEDIATION_URI.format(mac=self._mac)}"
-        return digest_auth.build_digest_header("GET", uri)
-
     async def connect(self) -> bool:
-        """Handshake + ouverture du WebSocket (entièrement non-bloquant pour HA)."""
-        _LOGGER.info("Connexion à la box Tydom (%s)…", self._host)
-
-        ssl_context = self._build_ssl_context()
+        _LOGGER.info("Connexion Tydom (%s)…", self._host)
         loop = asyncio.get_event_loop()
 
-        # --- Étape 1 : handshake HTTP dans un thread executor (non-bloquant) ---
         try:
-            www_auth = await loop.run_in_executor(
-                None,
-                _do_http_handshake_sync,
-                self._host,
-                TYDOM_PORT,
-                self._mac,
-                self._password,
-                ssl_context,
+            sock = await loop.run_in_executor(
+                None, _do_handshake_sync,
+                self._host, TYDOM_PORT, self._mac, self._password,
             )
+        except PermissionError as exc:
+            _LOGGER.error("%s", exc)
+            return False
         except Exception as exc:
             _LOGGER.error("Impossible de contacter la box Tydom : %s", exc)
             return False
 
-        if not www_auth:
-            _LOGGER.error("Pas de challenge Digest reçu (WWW-Authenticate vide)")
-            return False
-
-        _LOGGER.debug("Challenge Digest reçu : %s", www_auth)
-
-        # --- Étape 2 : calcul de la réponse Digest (CPU pur, non-bloquant) ---
-        try:
-            authorization = self._build_digest_header(www_auth)
-        except Exception as exc:
-            _LOGGER.error("Erreur calcul Digest : %s", exc)
-            return False
-
-        _LOGGER.debug("Authorization : %s", authorization)
-
-        # --- Étape 3 : ouverture du WebSocket asyncio ---
-        uri_path = MEDIATION_URI.format(mac=self._mac)
-        ws_uri = f"wss://{self._host}:{TYDOM_PORT}{uri_path}"
-
-        try:
-            self._websocket = await websockets.connect(
-                ws_uri,
-                additional_headers={"Authorization": authorization},
-                ssl=ssl_context,
-                ping_interval=30,
-                ping_timeout=10,
-                close_timeout=5,
-            )
-        except Exception as exc:
-            _LOGGER.error("Impossible d'ouvrir le WebSocket Tydom : %s", exc)
-            return False
-
+        self._sock      = sock
         self._connected = True
-        _LOGGER.info("WebSocket Tydom connecté avec succès")
+        _LOGGER.info("WebSocket Tydom connecté (%s)", self._host)
         return True
 
     async def disconnect(self) -> None:
-        """Ferme proprement la connexion."""
         self._connected = False
         if self._listen_task and not self._listen_task.done():
             self._listen_task.cancel()
@@ -334,108 +392,130 @@ class TydomClient:
                 await self._listen_task
             except asyncio.CancelledError:
                 pass
-        if self._websocket:
-            await self._websocket.close()
-            self._websocket = None
+        if self._sock:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+            self._sock = None
 
     # ------------------------------------------------------------------
-    # Envoi de requêtes
+    # Envoi / réception via executor
     # ------------------------------------------------------------------
 
     def _next_transac_id(self) -> int:
         self._transac_id = (self._transac_id + 1) % 10000
         return self._transac_id
 
-    def _build_get_request(self, path: str) -> bytes:
+    def _build_get(self, path: str) -> bytes:
         tid = self._next_transac_id()
-        return (
-            f"{self._cmd_prefix}GET {path} HTTP/1.1\r\n"
-            f"Content-Length: 0\r\n"
+        return _ws_encode(
+            f"GET {path} HTTP/1.1\r\nContent-Length: 0\r\n"
             f"Content-Type: application/json; charset=UTF-8\r\n"
-            f"Transac-Id: {tid}\r\n\r\n"
-        ).encode("ascii")
-
-    def _build_put_request(self, path: str, body: str) -> bytes:
-        tid = self._next_transac_id()
-        return (
-            f"{self._cmd_prefix}PUT {path} HTTP/1.1\r\n"
-            f"Content-Length: {len(body)}\r\n"
-            f"Content-Type: application/json; charset=UTF-8\r\n"
-            f"Transac-Id: {tid}\r\n\r\n"
-            f"{body}\r\n\r\n"
-        ).encode("ascii")
-
-    async def _send(self, data: bytes) -> None:
-        if not self._websocket or not self._connected:
-            raise ConnectionError("WebSocket non connecté")
-        await self._websocket.send(data)
-
-    async def get(self, path: str) -> dict | list | None:
-        await self._send(self._build_get_request(path))
-        raw = await self._websocket.recv()
-        return _extract_json_from_response(
-            raw if isinstance(raw, bytes) else raw.encode(), self._cmd_prefix
+            f"Transac-Id: {tid}\r\n\r\n".encode("ascii")
         )
 
-    async def put(self, path: str, body_dict: list | dict) -> None:
-        body = json.dumps(body_dict)
-        await self._send(self._build_put_request(path, body))
+    def _build_put(self, path: str, body: str) -> bytes:
+        tid = self._next_transac_id()
+        return _ws_encode(
+            f"PUT {path} HTTP/1.1\r\nContent-Length: {len(body)}\r\n"
+            f"Content-Type: application/json; charset=UTF-8\r\n"
+            f"Transac-Id: {tid}\r\n\r\n{body}\r\n\r\n".encode("ascii")
+        )
+
+    async def _send(self, frame: bytes) -> None:
+        if not self._sock or not self._connected:
+            raise ConnectionError("Non connecté")
+        loop = asyncio.get_event_loop()
+        async with self._send_lock:
+            await loop.run_in_executor(None, _sock_send_frame, self._sock, frame)
+
+    async def _recv(self, timeout: float = 10.0) -> tuple[int, bytes]:
+        if not self._sock:
+            raise ConnectionError("Non connecté")
+        loop = asyncio.get_event_loop()
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, _sock_recv_frame, self._sock),
+            timeout=timeout,
+        )
+
+    async def _request(self, frame: bytes) -> dict | list | None:
+        await self._send(frame)
+        while True:
+            opcode, payload = await self._recv()
+            if opcode == 0x9:  # PING
+                await self._send(_ws_pong_frame(payload))
+                continue
+            if opcode == 0x8:  # CLOSE
+                self._connected = False
+                return None
+            return _extract_json(payload)
 
     # ------------------------------------------------------------------
     # Requêtes de haut niveau
     # ------------------------------------------------------------------
 
-    async def get_info(self) -> dict | None:
-        return await self.get("/info")
+    async def get(self, path: str) -> dict | list | None:
+        return await self._request(self._build_get(path))
 
-    async def get_devices_data(self) -> list | None:
-        return await self.get("/devices/data")
+    async def put(self, path: str, body: list | dict) -> None:
+        await self._send(self._build_put(path, json.dumps(body)))
 
-    async def get_devices_meta(self) -> list | None:
-        return await self.get("/devices/meta")
-
-    async def get_configs_file(self) -> dict | None:
-        return await self.get("/configs/file")
+    async def get_info(self)         -> dict | None: return await self.get("/info")
+    async def get_devices_data(self) -> list | None: return await self.get("/devices/data")
+    async def get_devices_meta(self) -> list | None: return await self.get("/devices/meta")
+    async def get_configs_file(self) -> dict | None: return await self.get("/configs/file")
 
     async def put_device_data(
         self, device_id: int, endpoint_id: int, name: str, value: Any
     ) -> None:
-        path = f"/devices/{device_id}/endpoints/{endpoint_id}/data"
-        await self.put(path, [{"name": name, "value": value}])
+        await self.put(
+            f"/devices/{device_id}/endpoints/{endpoint_id}/data",
+            [{"name": name, "value": value}]
+        )
 
     # ------------------------------------------------------------------
     # Écoute des messages push
     # ------------------------------------------------------------------
 
     async def listen(self) -> None:
-        """Écoute en boucle les messages push de la box."""
-        if not self._websocket or not self._connected:
-            _LOGGER.error("listen() appelé sans connexion active")
-            return
-
-        _LOGGER.debug("Début écoute messages Tydom")
-        try:
-            async for message in self._websocket:
-                raw = message if isinstance(message, bytes) else message.encode()
-                await self._handle_raw_message(raw)
-        except websockets.ConnectionClosed:
-            _LOGGER.warning("Connexion Tydom fermée")
-            self._connected = False
-        except Exception as exc:
-            _LOGGER.error("Erreur boucle écoute Tydom : %s", exc)
-            self._connected = False
-
-    async def _handle_raw_message(self, raw: bytes) -> None:
-        uri_origin = _get_uri_origin(raw, self._cmd_prefix)
-        data = _extract_json_from_response(raw, self._cmd_prefix)
-        if data is None:
-            return
-        _LOGGER.debug("Message Tydom [%s]", uri_origin)
-        if self._message_callback and uri_origin:
+        _LOGGER.debug("Écoute Tydom démarrée")
+        loop = asyncio.get_event_loop()
+        while self._connected:
             try:
-                self._message_callback(uri_origin, data)
+                opcode, payload = await asyncio.wait_for(
+                    loop.run_in_executor(None, _sock_recv_frame, self._sock),
+                    timeout=60,
+                )
+                if opcode == 0x9:  # PING
+                    await self._send(_ws_pong_frame(payload))
+                    continue
+                if opcode == 0x8:  # CLOSE
+                    self._connected = False
+                    break
+                if not payload:
+                    continue
+                uri_origin = _get_uri_origin(payload)
+                data       = _extract_json(payload)
+                if data is not None and self._message_callback and uri_origin:
+                    try:
+                        self._message_callback(uri_origin, data)
+                    except Exception as exc:
+                        _LOGGER.error("Erreur callback : %s", exc)
+            except asyncio.TimeoutError:
+                if self._connected:
+                    try:
+                        await self._send(_ws_ping_frame())
+                    except Exception:
+                        self._connected = False
+                        break
+            except asyncio.CancelledError:
+                break
             except Exception as exc:
-                _LOGGER.error("Erreur callback message Tydom : %s", exc)
+                _LOGGER.error("Erreur écoute Tydom : %s", exc)
+                self._connected = False
+                break
+        _LOGGER.debug("Écoute Tydom terminée")
 
     def start_listening(self) -> asyncio.Task:
         self._listen_task = asyncio.ensure_future(self.listen())
@@ -443,4 +523,4 @@ class TydomClient:
 
     @property
     def is_connected(self) -> bool:
-        return self._connected and self._websocket is not None
+        return self._connected and self._sock is not None
